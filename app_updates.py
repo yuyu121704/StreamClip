@@ -20,13 +20,16 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 
-VERSION = "2026.09.19.3"
+VERSION = "2026.09.20.3"
 REPOSITORY = "yuyu121704/StreamClip"
 RELEASES_URL = f"https://github.com/{REPOSITORY}/releases"
 API_URL = f"https://api.github.com/repos/{REPOSITORY}/releases?per_page=100"
 MAX_PACKAGE_SIZE = 1024 * 1024 * 1024
 LOCAL_HISTORY = [
-    {"version": VERSION, "date": "2026-09-19", "summary": "修复 GitHub API 受限时无法检查版本，保留正式版识别和更新包校验。"},
+    {"version": VERSION, "date": "2026-09-20", "summary": "降低媒体处理内存：限制 FFmpeg 解码、滤镜和编码线程，多项处理排队执行；保留分辨率、帧率、画质参数、字幕与严格校验。"},
+    {"version": "2026.09.20.2", "date": "2026-09-20", "summary": "修复部分 H.264 录播从中间切片时缺少参考帧导致失败；自动从头解码重试，保留字幕时间轴和严格媒体校验。"},
+    {"version": "2026.09.20.1", "date": "2026-09-20", "summary": "录制正常收尾；有限修复末尾损坏视频包并严格校验，避免异常帧率转码；失败保留分段时长。"},
+    {"version": "2026.09.19.3", "date": "2026-09-19", "summary": "修复 GitHub API 受限时无法检查版本，保留正式版识别和更新包校验。"},
     {"version": "2026.09.19.2", "date": "2026-09-19", "summary": "新增版本中心：历史版本、更新检查与提醒、校验下载及安装重启。"},
     {"version": "2026.09.19.1", "date": "2026-09-19", "summary": "使用 Windows DPAPI 保护凭据，完善源码启动器和启动异常日志。"},
     {"version": "2026.09.19", "date": "2026-09-19", "summary": "精简切片列表载荷，修复反复刷新引起的界面内存上涨。"},

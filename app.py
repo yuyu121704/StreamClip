@@ -37,7 +37,7 @@ import xml.etree.ElementTree as ET
 import zlib
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
@@ -4996,10 +4996,14 @@ def merge_audio_intervals(intervals: list[dict[str, Any]], gap: float = 0.2) -> 
 
 
 class FFmpeg:
+    # Shared across renderers: one media subprocess per app, independent of live capture.
+    _media_lock = threading.Lock()
+
     def __init__(self, settings: Settings):
         self.settings = settings
         self._tools_key: tuple[str, str] | None = None
         self._tools_lock = threading.Lock()
+        self._tool_aliases = {settings.ffmpeg_path: "ffmpeg", settings.ffprobe_path: "ffprobe"}
 
     def ensure_tools(self) -> None:
         """Prefer the app's complete tool pair over unrelated, stripped PATH builds."""
@@ -5030,6 +5034,11 @@ class FFmpeg:
                         if not re.search(r"\s" + re.escape(name) + r"\s", listing):
                             raise RuntimeError("FFmpeg 缺少必需组件：" + name)
                     output(resolved[1], "-version")
+                    # Another worker may already have built a command using an old alias.
+                    self._tool_aliases.update({
+                        configured[0]: "ffmpeg", configured[1]: "ffprobe",
+                        resolved[0]: "ffmpeg", resolved[1]: "ffprobe",
+                    })
                     self.settings.ffmpeg_path, self.settings.ffprobe_path = resolved
                     self._tools_key = resolved
                     return
@@ -5038,19 +5047,30 @@ class FFmpeg:
             raise RuntimeError("媒体工具检查失败，请在高级设置选择完整的 FFmpeg 与 FFprobe：" + "；".join(errors))
 
     def _run(self, args: list[str], timeout: int | None = None) -> tuple[int, str, str]:
-        old_ffmpeg, old_ffprobe = self.settings.ffmpeg_path, self.settings.ffprobe_path
         self.ensure_tools()
         args = list(args)
-        if args[0] == old_ffmpeg:
-            args[0] = self.settings.ffmpeg_path
-        elif args[0] == old_ffprobe:
-            args[0] = self.settings.ffprobe_path
+        is_ffmpeg = self._tool_aliases[args[0]] == "ffmpeg"
+        args[0] = self.settings.ffmpeg_path if is_ffmpeg else self.settings.ffprobe_path
+        if is_ffmpeg:
+            limited = [args[0], "-filter_threads", "1", "-filter_complex_threads", "1"]
+            for arg in args[1:]:
+                if arg == "-i":
+                    limited.extend(["-threads", "2"])
+                limited.append(arg)
+            # All media commands here have one output. Bound both input and output
+            # frame pools; encoder-only limits still leave auto-threaded decoders.
+            limited[-1:-1] = ["-threads", "2"]
+            args = limited
         try:
-            completed = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            # Queue time is not part of the subprocess timeout; probes stay responsive.
+            with FFmpeg._media_lock if is_ffmpeg else nullcontext():
+                completed = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except FileNotFoundError as exc:
             raise RuntimeError(f"找不到 FFmpeg/FFprobe: {args[0]}") from exc
         except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(f"命令超时: {' '.join(args[:3])}") from exc
+            operation = "解码校验" if "null" in args else "合并" if "concat" in args else "转码" if "-vf" in args else "媒体处理"
+            inputs = [Path(args[index + 1]).name for index, arg in enumerate(args[:-1]) if arg == "-i" and not args[index + 1].startswith(("http:", "https:"))]
+            raise RuntimeError(f"{operation}命令超时（{timeout} 秒）：{Path(args[0]).name}，输入：{'、'.join(inputs) or '未指定本地文件'}") from exc
         return completed.returncode, completed.stdout, completed.stderr
 
     def duration(self, path: Path) -> float:
@@ -5063,7 +5083,7 @@ class FFmpeg:
             raise RuntimeError("FFprobe 未返回有效时长") from exc
 
     def media_info(self, path: Path) -> dict[str, Any]:
-        entries = "stream=codec_type,codec_name,profile,width,height,pix_fmt,sample_aspect_ratio,r_frame_rate,time_base,sample_rate,channels,channel_layout,extradata_hash,start_time,duration,nb_frames:format=duration"
+        entries = "stream=codec_type,codec_name,profile,width,height,pix_fmt,sample_aspect_ratio,r_frame_rate,avg_frame_rate,time_base,sample_rate,channels,channel_layout,extradata_hash,start_time,duration,nb_frames:format=duration"
         code, stdout, stderr = self._run([self.settings.ffprobe_path, "-v", "error", "-show_entries", entries, "-show_data_hash", "sha256", "-of", "json", str(path)], 60)
         if code != 0:
             raise RuntimeError(f"读取媒体信息失败：{path.name}：{stderr[:500]}")
@@ -5139,6 +5159,43 @@ class FFmpeg:
             os.replace(repaired, path)
         logging.warning("录播末尾 AAC 包不完整，已移除最后一个音频包并通过音频校验（视频保留）：%s", path.name)
 
+    def _check_recording_video(self, path: Path, expected_duration: float, *, audio: bool) -> None:
+        """Only recover one terminal video packet, then strictly decode everything."""
+        try:
+            self.validate_media(path, expected_duration, audio=audio, decode=True)
+            return
+        except RuntimeError as exc:
+            if "媒体解码校验失败" not in str(exc) or not re.search(r"\[(?:h264|hevc) @", str(exc)):
+                raise
+            original_error = str(exc)
+        info = self.media_info(path)
+        video = next(stream for stream in info["streams"] if stream["codec_type"] == "video")
+        frames = int(video.get("nb_frames") or 0)
+        if video.get("codec_name") not in {"h264", "hevc"} or frames <= 1:
+            raise RuntimeError(original_error)
+        with tempfile.TemporaryDirectory(prefix=".video-tail-", dir=str(path.parent)) as folder:
+            video_path = Path(folder) / "video.mp4"
+            repaired = Path(folder) / "repaired.mp4"
+            commands = [
+                ["-i", str(path), "-map", "0:v:0", "-c", "copy", "-frames:v", str(frames - 1), str(video_path)],
+                ["-i", str(video_path), "-i", str(path), "-map", "0:v:0", "-map", "1:a:0?", "-c", "copy", str(repaired)],
+            ]
+            for args in commands:
+                code, _, error = self._run(
+                    [self.settings.ffmpeg_path, "-hide_banner", "-v", "error", "-nostdin", "-xerror", "-copyts", "-y", *args[:-1], "-video_track_timescale", "90000", args[-1]],
+                    max(1800, math.ceil(expected_duration)),
+                )
+                if code != 0 or error.strip():
+                    raise RuntimeError(f"录播末尾视频修复失败，已保留原文件：{path.name}：{error[:500]}")
+            repaired_info = self.media_info(repaired)
+            repaired_video = next(stream for stream in repaired_info["streams"] if stream["codec_type"] == "video")
+            if int(repaired_video.get("nb_frames") or 0) != frames - 1:
+                raise RuntimeError(f"录播末尾视频包数量异常，已保留原文件：{path.name}")
+            # Middle damage, another broken packet, or a lost reference must still fail.
+            self.validate_media(repaired, expected_duration, audio=audio, decode=True)
+            os.replace(repaired, path)
+        logging.warning("录播末尾视频包不完整，仅移除最后一个视频包并通过完整音视频校验（音频保留）：%s", path.name)
+
     def merge_recording_parts(self, parts: list[Path], destination: Path) -> Path:
         if not parts or any(not part.is_file() or part.stat().st_size == 0 for part in parts):
             raise RuntimeError("录播分段缺失或为空，已保留原文件")
@@ -5148,14 +5205,13 @@ class FFmpeg:
         selected = [[next(stream for stream in info["streams"] if stream["codec_type"] == "video")] + [stream for stream in info["streams"] if stream["codec_type"] == "audio"][:1] for info in infos]
         if len({len(streams) for streams in selected}) != 1:
             raise RuntimeError("重连分段的音轨数量不一致，无法无损合并；已保留原始分段")
-        signature_keys = ("codec_name", "profile", "width", "height", "pix_fmt", "sample_aspect_ratio", "r_frame_rate", "time_base", "sample_rate", "channels", "channel_layout", "extradata_hash")
+        signature_keys = ("codec_name", "profile", "width", "height", "pix_fmt", "sample_aspect_ratio", "time_base", "sample_rate", "channels", "channel_layout", "extradata_hash")
         signatures = [tuple(tuple(stream.get(key) for key in signature_keys) for stream in streams) for streams in selected]
         normalize = any(signature != signatures[0] for signature in signatures[1:])
         video = selected[0][0]
         width, height = int(video.get("width") or 0), int(video.get("height") or 0)
-        rate = str(video.get("r_frame_rate") or "0/0")
-        if width <= 0 or height <= 0 or not re.fullmatch(r"[1-9]\d*(?:/[1-9]\d*)?", rate):
-            raise RuntimeError("录播视频尺寸或帧率无效，已保留原始分段")
+        if width <= 0 or height <= 0:
+            raise RuntimeError("录播视频尺寸无效，已保留原始分段")
         audio = len(selected[0]) == 2
         expected = sum(info["duration"] for info in infos)
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -5164,19 +5220,35 @@ class FFmpeg:
             manifest = []
             for index, (part, info) in enumerate(zip(parts, infos)):
                 output = stage / f"{index:04d}.mp4"
-                args = [self.settings.ffmpeg_path, "-hide_banner", "-v", "error", "-nostdin", "-xerror", "-abort_on", "empty_output_stream", "-y", "-i", str(part), "-map", "0:v:0", "-map", "0:a:0?"]
-                if normalize:
-                    # Different codecs/parameter sets cannot share one copied MP4 track.
-                    args += ["-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={rate},format=yuv420p", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-c:a", "aac", "-ar", "48000", "-ac", "2"]
-                else:
-                    args += ["-c", "copy"]
-                args += ["-video_track_timescale", "90000", str(output)]
+                args = [self.settings.ffmpeg_path, "-hide_banner", "-v", "error", "-nostdin", "-xerror", "-abort_on", "empty_output_stream", "-y", "-i", str(part), "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-video_track_timescale", "90000", str(output)]
                 code, _, stderr = self._run(args, max(1800, math.ceil(info["duration"] * 3)))
                 if code != 0:
                     raise RuntimeError(f"录播分段封装失败：{part.name}：{stderr[:500]}")
                 self.validate_media(output, info["duration"], audio=audio)
                 if audio:
                     self._check_recording_audio(output, info["duration"])
+                self._check_recording_video(output, info["duration"], audio=audio)
+                if normalize:
+                    # TS r_frame_rate can be its 90 kHz clock. Use the remuxed average.
+                    if index == 0:
+                        video = next(stream for stream in self.media_info(output)["streams"] if stream["codec_type"] == "video")
+                        rate = str(video.get("avg_frame_rate") or "0/0")
+                        match = re.fullmatch(r"([1-9]\d*)(?:/([1-9]\d*))?", rate)
+                        if not match or not 0 < int(match[1]) / int(match[2] or 1) <= 240:
+                            raise RuntimeError("录播平均帧率无效或超过 240 fps，已保留原始分段")
+                    normalized = stage / f"{index:04d}-normalized.mp4"
+                    # Different codecs/parameter sets cannot share one copied MP4 track.
+                    code, _, stderr = self._run([
+                        self.settings.ffmpeg_path, "-hide_banner", "-v", "error", "-nostdin", "-xerror", "-abort_on", "empty_output_stream", "-y",
+                        "-i", str(output), "-map", "0:v:0", "-map", "0:a:0?",
+                        "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={rate},format=yuv420p",
+                        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-c:a", "aac", "-ar", "48000", "-ac", "2",
+                        "-video_track_timescale", "90000", str(normalized),
+                    ], max(1800, math.ceil(info["duration"] * 3)))
+                    if code != 0 or stderr.strip():
+                        raise RuntimeError(f"录播分段转码失败：{part.name}：{stderr[:500]}")
+                    self.validate_media(normalized, info["duration"], audio=audio)
+                    os.replace(normalized, output)
                 manifest.append(f"file {output.name}\n")
             playlist = stage / "parts.ffconcat"
             playlist.write_text("ffconcat version 1.0\n" + "".join(manifest), encoding="utf-8")
@@ -5608,22 +5680,44 @@ class FFmpeg:
         return "subtitles=" + ":".join(options)
 
     def clip(self, source: Path, destination: Path, start: float, end: float, subtitle_path: Path | None = None) -> None:
+        if not math.isfinite(start) or not math.isfinite(end) or start < 0 or end <= start:
+            raise ValueError("切片起止时间无效")
         destination.parent.mkdir(parents=True, exist_ok=True)
         duration = max(0.1, end - start)
         audio = any(stream["codec_type"] == "audio" for stream in self.media_info(source)["streams"])
         with tempfile.TemporaryDirectory(prefix=".clip-", dir=str(destination.parent)) as folder, self._filter_assets() as prepare:
             temporary = Path(folder) / "clip.mp4"
-            args = [self.settings.ffmpeg_path, "-hide_banner", "-loglevel", "error", "-nostdin", "-xerror", "-abort_on", "empty_output_stream", "-y", "-ss", f"{start:.3f}", "-i", str(source), "-t", f"{duration:.3f}"]
+            subtitle = ""
             if subtitle_path is not None and subtitle_path.is_file() and subtitle_path.stat().st_size > 0:
                 # libass must see only the selected file, not every font in Windows/Fonts.
                 font_file = prepare(self._configured_font_file(), isolate_font=True)
-                args.extend(["-vf", self.subtitle_filter(prepare(subtitle_path), font_file)])
-            args.extend(["-map", "0:v:0", "-map", "0:a:0?", "-sn", "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", "-movflags", "+faststart", str(temporary)])
-            code, _, stderr = self._run(args, 1800)
-            if code != 0 or stderr.strip() or not temporary.is_file() or temporary.stat().st_size == 0:
-                raise RuntimeError(f"生成切片失败: {stderr[:500]}")
-            self.validate_media(temporary, duration, audio=audio)
-            os.replace(temporary, destination)
+                subtitle = self.subtitle_filter(prepare(subtitle_path), font_file)
+            for sequential in (False, True):
+                args = [self.settings.ffmpeg_path, "-hide_banner", "-loglevel", "error", "-nostdin", "-xerror", "-abort_on", "empty_output_stream", "-y"]
+                if not sequential:
+                    args.extend(["-ss", f"{start:.3f}"])
+                args.extend(["-i", str(source), "-t", f"{duration:.3f}"])
+                # Open GOP seeks can lose references even in intact media. Retry once
+                # from the beginning, resetting both clocks before clip-relative subtitles.
+                filters = [f"trim=start={start:.3f}", f"setpts=PTS-{start:.3f}/TB"] if sequential else []
+                if subtitle:
+                    filters.append(subtitle)
+                if filters:
+                    args.extend(["-vf", ",".join(filters)])
+                if sequential and audio:
+                    args.extend(["-af", f"atrim=start={start:.3f},asetpts=PTS-{start:.3f}/TB"])
+                args.extend(["-map", "0:v:0", "-map", "0:a:0?", "-sn", "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", "-movflags", "+faststart", str(temporary)])
+                code, _, stderr = self._run(args, max(1800, math.ceil(end * 2)) if sequential else 1800)
+                if not sequential and start > 0 and re.search(r"\[h264 @ [^\]\r\n]+\]\s+(?:co located POCs unavailable|mmco: unref short failure)", stderr):
+                    logging.warning("切片快速定位缺少 H.264 参考帧，正在从头解码重试：%s，起点 %.3f 秒", source.name, start)
+                    temporary.unlink(missing_ok=True)
+                    continue
+                if code != 0 or stderr.strip() or not temporary.is_file() or temporary.stat().st_size == 0:
+                    context = "（从头解码重试仍未通过，原片保留）" if sequential else ""
+                    raise RuntimeError(f"生成切片失败{context}: {stderr[:500] or f'FFmpeg 退出码 {code}，未生成有效切片'}")
+                self.validate_media(temporary, duration, audio=audio, decode=sequential)
+                os.replace(temporary, destination)
+                return
 
     def _reference_cover_image(self, background: Image.Image, title: str) -> Image.Image:
         """Paint the measured cover typefaces on the reference account's 1080p grid."""
@@ -8411,12 +8505,6 @@ class RecorderService:
             states = list(self._active.values())
         for state in states:
             state["stop"].set()
-            process = state.get("process")
-            if process and process.poll() is None:
-                try:
-                    process.terminate()
-                except OSError:
-                    pass
         if self.monitor_thread and self.monitor_thread.is_alive():
             self.monitor_thread.join(timeout=3)
         self.executor.shutdown(wait=False, cancel_futures=True)
@@ -8947,30 +9035,44 @@ class RecorderService:
         if not state:
             return
         state["manual_stop"] = True
+        if state["stop"].is_set():
+            return
         state["stop"].set()
-        process = state.get("process")
-        if process and process.poll() is None:
-            try:
-                process.terminate()
-            except OSError:
-                pass
         self.emit("info", f"正在停止房间 {room_id} 的录制…", room_id=room_id)
 
     @staticmethod
     def _stop_process(process: subprocess.Popen[Any] | None) -> None:
-        if not process or process.poll() is not None:
+        if not process:
             return
+        stdin = process.stdin
         try:
-            process.terminate()
-        except OSError:
-            pass
-        try:
-            process.wait(timeout=20)
-        except subprocess.TimeoutExpired:
+            if process.poll() is not None:
+                return
+            # Windows terminate() kills immediately; q lets FFmpeg flush its muxer.
             try:
-                process.kill()
-            except OSError:
+                if stdin and not stdin.closed:
+                    stdin.write(b"q\n")
+                    stdin.flush()
+            except (OSError, ValueError):
                 pass
+            try:
+                process.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                try:
+                    process.terminate()
+                except OSError:
+                    pass
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+        finally:
+            if stdin:
+                try:
+                    stdin.close()
+                except OSError:
+                    pass
 
     def _schedule_recording_recovery(self, room_id: str, state: dict[str, Any]) -> None:
         """Throttle automatic resurrection after a broken recording session."""
@@ -9003,6 +9105,7 @@ class RecorderService:
         final_path: Path | None = None
         danmaku_path: Path | None = None
         collector: DanmakuCollector | None = None
+        parts: list[Path] = []
         finished = False
         try:
             self.ffmpeg.ensure_tools()
@@ -9062,7 +9165,6 @@ class RecorderService:
                 except Exception as exc:
                     self.emit("warning", f"弹幕采集启动失败，继续录播：{exc}", recording_id=recording_id)
 
-            parts: list[Path] = []
             retries_used = 0
             last_return_code: int | None = None
             while not state["stop"].is_set() and not self.stop_event.is_set():
@@ -9084,7 +9186,7 @@ class RecorderService:
                     "-hide_banner",
                     "-loglevel",
                     "warning",
-                    "-nostdin",
+                    "-stdin",
                     "-user_agent",
                     USER_AGENT,
                     "-referer",
@@ -9117,7 +9219,7 @@ class RecorderService:
                 ffmpeg_log.write(f"\n[{now_text()}] attempt {retries_used + 1}\n".encode("utf-8"))
                 ffmpeg_log.flush()
                 try:
-                    process = subprocess.Popen(ffmpeg_args, stdout=subprocess.DEVNULL, stderr=ffmpeg_log, creationflags=creationflags)
+                    process = subprocess.Popen(ffmpeg_args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=ffmpeg_log, bufsize=0, creationflags=creationflags)
                 except Exception:
                     ffmpeg_log.close()
                     raise
@@ -9125,7 +9227,7 @@ class RecorderService:
                 last_size = 0
                 last_growth = time.monotonic()
                 while process.poll() is None and not state["stop"].is_set() and not self.stop_event.is_set():
-                    time.sleep(1)
+                    state["stop"].wait(1)
                     try:
                         size = part_path.stat().st_size if part_path.exists() else 0
                     except OSError:
@@ -9137,8 +9239,7 @@ class RecorderService:
                         self.emit("warning", f"录播文件 {self.settings.record_stall_seconds} 秒未增长，重启流连接", recording_id=recording_id)
                         self._stop_process(process)
                         break
-                if process.poll() is None:
-                    self._stop_process(process)
+                self._stop_process(process)
                 last_return_code = process.poll()
                 state["process"] = None
                 ffmpeg_log.close()
@@ -9184,7 +9285,7 @@ class RecorderService:
                     part.unlink(missing_ok=True)
                 self._recovery.pop(room_id, None)
                 self.emit("recording_done", f"录播完成：{title}（{format_seconds(duration)}）", recording_id=recording_id)
-                if status == "complete" and bool(room_config.get("auto_asr", 1)) and bool(self.settings.auto_slice):
+                if status == "complete" and not self.stop_event.is_set() and bool(room_config.get("auto_asr", 1)) and bool(self.settings.auto_slice):
                     self.analyze_recording(recording_id)
             else:
                 detail = ""
@@ -9202,10 +9303,20 @@ class RecorderService:
                 self._schedule_recording_recovery(room_id, state)
         except Exception as exc:
             detail = f"录制失败：{exc}"
+            retained_duration = 0.0
+            if parts:
+                for part in parts:
+                    try:
+                        duration = self.ffmpeg.duration(part)
+                        if math.isfinite(duration) and duration > 0:
+                            retained_duration += duration
+                    except (OSError, RuntimeError, ValueError):
+                        pass
+                detail = f"录播收尾失败（已保留 {len(parts)} 个原始分段，探测时长 {format_seconds(retained_duration)}，尚未通过完整校验）：{exc}"
             if collector:
                 collector.stop()
             if recording_id is not None and not finished:
-                self.db.finish_recording(recording_id, "error", str(final_path or source_path or ""), now_text(), 0, detail)
+                self.db.finish_recording(recording_id, "error", str(final_path or source_path or ""), now_text(), retained_duration, detail)
             self.emit("error", detail, room_id=room_id, recording_id=recording_id)
             self._schedule_recording_recovery(room_id, state)
         finally:

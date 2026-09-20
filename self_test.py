@@ -15,9 +15,113 @@ import tempfile
 import threading
 import time
 import urllib.error
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import app
+
+
+def assert_media_resource_limits() -> None:
+    renderers = [app.FFmpeg(app.Settings()) for _ in range(4)]
+    for renderer in renderers:
+        renderer.ensure_tools = lambda: None
+    command = ["ffmpeg", "-y", "-i", "video.mp4", "-i", "audio.m4a",
+               "-map", "0:v:0", "-map", "1:a:0", "-c:v", "libx264",
+               "-preset", "veryfast", "-c:a", "aac", "-vf", "subtitles=clip.srt", "clip.mp4"]
+    original = list(command)
+    probe = ["ffprobe", "-v", "error", "-of", "json", "video.mp4"]
+    with patch.object(app.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "ok", "")) as run:
+        assert renderers[0]._run(command, 90) == (0, "ok", "")
+        args = run.call_args.args[0]
+        assert args[:5] == ["ffmpeg", "-filter_threads", "1", "-filter_complex_threads", "1"]
+        assert all(args[i - 2:i] == ["-threads", "2"] for i, arg in enumerate(args) if arg == "-i")
+        assert args[-3:] == ["-threads", "2", "clip.mp4"]
+        assert args.count("-threads") == 3 and command == original
+        stripped = [args[0]]
+        index = 1
+        while index < len(args):
+            if args[index] in ("-threads", "-filter_threads", "-filter_complex_threads"):
+                index += 2
+            else:
+                stripped.append(args[index])
+                index += 1
+        assert stripped == original, "resource limits changed media/quality options"
+        assert run.call_args.kwargs["timeout"] == 90
+        renderers[0]._run(probe, 15)
+        assert run.call_args.args[0] == probe
+
+    # A second call can arrive with arguments made before another worker resolved tools.
+    resolved = app.FFmpeg(app.Settings(ffmpeg_path="custom-encoder", ffprobe_path="custom-probe"))
+    with patch.object(app.shutil, "which", side_effect=lambda name: "/tools/" + name), patch.object(
+        app.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, " subtitles drawtext scale libx264 aac null mp4 ", "")
+    ) as run:
+        resolved.ensure_tools()
+        resolved._run(["custom-encoder", "-i", "video.mp4", "out.mp4"], 90)
+        assert run.call_args.args[0][0] == "/tools/custom-encoder"
+        assert run.call_args.args[0][-3:] == ["-threads", "2", "out.mp4"]
+        resolved._run(["custom-probe", "-v", "error", "video.mp4"], 15)
+        assert run.call_args.args[0] == ["/tools/custom-probe", "-v", "error", "video.mp4"]
+        resolved._run([resolved.settings.ffmpeg_path, "-i", "video.mp4", "out.mp4"], 90)
+        assert run.call_args.args[0][-3:] == ["-threads", "2", "out.mp4"]
+
+    # Events prove contenders have actually reached the shared gate, without sleep races.
+    gate = threading.Lock()
+    state_lock = threading.Lock()
+    all_waiting, entered, release = (threading.Event() for _ in range(3))
+    attempts, active, peak, completed = 0, 0, 0, 0
+
+    class ObservedGate:
+        def __enter__(self):
+            nonlocal attempts
+            with state_lock:
+                attempts += 1
+                if attempts == 4:
+                    all_waiting.set()
+            gate.acquire()
+
+        def __exit__(self, *_):
+            gate.release()
+
+    def run(args, **kwargs):
+        nonlocal active, peak, completed
+        if args[0] == "ffprobe":
+            assert not release.is_set(), "probe waited behind media work"
+            return subprocess.CompletedProcess(args, 0, "probe", "")
+        assert kwargs["timeout"] == 90
+        with state_lock:
+            active += 1
+            peak = max(peak, active)
+        entered.set()
+        try:
+            assert release.wait(5), "test failed to release the media process"
+            return subprocess.CompletedProcess(args, 0, "media", "")
+        finally:
+            with state_lock:
+                active -= 1
+                completed += 1
+
+    with patch.object(app.FFmpeg, "_media_lock", ObservedGate()), patch.object(app.subprocess, "run", side_effect=run):
+        with app.ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [executor.submit(renderer._run, command, 90) for renderer in renderers]
+            try:
+                assert entered.wait(5) and all_waiting.wait(5)
+                assert executor.submit(renderers[0]._run, probe, 15).result(5) == (0, "probe", "")
+                with state_lock:
+                    assert active == peak == 1 and completed == 0
+            finally:
+                release.set()
+            assert [future.result(5) for future in futures] == [(0, "media", "")] * 4
+            assert peak == 1 and completed == 4
+    for failure in (FileNotFoundError("ffmpeg"), subprocess.TimeoutExpired(command, 90)):
+        with patch.object(app.subprocess, "run", side_effect=failure):
+            try:
+                renderers[0]._run(command, 90)
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("media launch failure was swallowed")
+        assert app.FFmpeg._media_lock.acquire(blocking=False), "failed media command leaked its gate"
+        app.FFmpeg._media_lock.release()
+    print("Media resource checks passed: bounded input/output/filter threads, shared queue, free probes, all jobs complete, exception release")
 
 
 def assert_media_failure_guards() -> None:
@@ -44,22 +148,26 @@ def assert_media_failure_guards() -> None:
             if app.os.name == "nt":
                 assert kwargs.get("creationflags", 0) & subprocess.CREATE_NO_WINDOW, "recording FFmpeg would open a console"
                 assert not kwargs["creationflags"] & subprocess.CREATE_NEW_CONSOLE
-            assert "-nostdin" in args and kwargs["stdout"] == subprocess.DEVNULL
+            assert "-stdin" in args and "-nostdin" not in args and kwargs["stdin"] == subprocess.PIPE
+            assert kwargs["stdout"] == subprocess.DEVNULL and kwargs["bufsize"] == 0
             assert hasattr(kwargs["stderr"], "write"), "recording diagnostics must remain in the log"
             commands.append(args)
             launch_flags.append(kwargs["creationflags"])
             Path(args[-1]).write_bytes(b"retained original segment")
             class FinishedProcess:
+                stdin = io.BytesIO()
+
                 def poll(self):
                     return 0
             return FinishedProcess()
 
         try:
-            with patch.object(service.ffmpeg, "ensure_tools"), patch.object(app.BilibiliClient, "room_info", side_effect=[{"live_status": True, "title": "测试录制"}, {"live_status": False}]), patch.object(app.BilibiliClient, "stream_urls", return_value=["https://example.invalid/live"]), patch.object(app.subprocess, "Popen", side_effect=recorded_process), patch.object(service.ffmpeg, "merge_recording_parts", side_effect=RuntimeError("synthetic media validation failure")), patch.object(service, "analyze_recording") as analyze:
+            with patch.object(service.ffmpeg, "ensure_tools"), patch.object(app.BilibiliClient, "room_info", side_effect=[{"live_status": True, "title": "测试录制"}, {"live_status": False}]), patch.object(app.BilibiliClient, "stream_urls", return_value=["https://example.invalid/live"]), patch.object(app.subprocess, "Popen", side_effect=recorded_process), patch.object(service.ffmpeg, "merge_recording_parts", side_effect=RuntimeError("synthetic media validation failure")), patch.object(service.ffmpeg, "duration", return_value=32.5), patch.object(service, "analyze_recording") as analyze:
                 service._record_worker("1", {"stop": app.threading.Event()})
                 analyze.assert_not_called()
             record = db.get_recording(1)
             assert record["status"] == "error" and "synthetic media validation failure" in record["error"]
+            assert record["duration"] == 32.5 and "已保留 1 个原始分段" in record["error"]
             assert Path(record["path"]).read_bytes() == b"retained original segment"
             assert [commands[0][i + 1] for i, arg in enumerate(commands[0]) if arg == "-map"] == ["0:v:0", "0:a:0?"]
             if app.os.name == "nt":
@@ -85,6 +193,206 @@ def assert_media_failure_guards() -> None:
         finally:
             service.executor.shutdown(wait=True)
     print("Media failure checks passed: empty decode rejected, source retained, failed recording is not analyzed; recorder launch remains windowless with diagnostics and exit codes")
+
+
+def assert_recording_stop_guards() -> None:
+    for fallback in (False, True):
+        process = Mock()
+        process.poll.return_value = None
+        process.stdin.closed = False
+        process.wait.side_effect = [subprocess.TimeoutExpired("ffmpeg", 20), subprocess.TimeoutExpired("ffmpeg", 5), 0] if fallback else [0]
+        app.RecorderService._stop_process(process)
+        process.stdin.write.assert_called_once_with(b"q\n")
+        process.stdin.flush.assert_called_once()
+        process.stdin.close.assert_called_once()
+        if fallback:
+            process.terminate.assert_called_once()
+            process.kill.assert_called_once()
+            assert [call.kwargs["timeout"] for call in process.wait.call_args_list] == [20, 5, 5]
+        else:
+            process.terminate.assert_not_called()
+            process.kill.assert_not_called()
+    with tempfile.TemporaryDirectory(prefix="liveclip-stop-") as folder:
+        settings = app.Settings(base_dir=folder)
+        settings.ensure_dirs()
+        service = app.RecorderService(settings, app.Database(Path(folder) / "app.db"), app.queue.Queue())
+        process = Mock()
+        state = {"stop": threading.Event(), "process": process}
+        service._active["1"] = state
+        with patch.object(service, "emit") as emit:
+            service.stop_recording("1")
+            service.stop_recording("1")
+            assert state["stop"].is_set() and state["manual_stop"]
+            emit.assert_called_once()
+        service.stop()
+        service.executor.shutdown(wait=True)
+        process.terminate.assert_not_called()
+        renderer = service.ffmpeg
+        args = ["ffmpeg", "-i", "https://example.invalid/private?token=secret", "-i", "local.mp4", "-f", "null", "-"]
+        with patch.object(renderer, "ensure_tools"), patch.object(app.subprocess, "run", side_effect=subprocess.TimeoutExpired(args, 30)):
+            try:
+                renderer._run(args, 30)
+            except RuntimeError as exc:
+                assert "解码校验命令超时" in str(exc) and "30 秒" in str(exc) and "local.mp4" in str(exc)
+                assert "secret" not in str(exc) and "example.invalid" not in str(exc)
+            else:
+                raise AssertionError("timeout was not reported")
+    print("Recording stop checks passed: graceful q, bounded fallback, no UI hard kill, private timeout diagnostics")
+
+
+def assert_clip_seek_guards() -> None:
+    with tempfile.TemporaryDirectory(prefix="liveclip-seek-guards-") as folder:
+        root = Path(folder)
+        renderer = app.FFmpeg(app.Settings(base_dir=folder, render_font_name="Arial"))
+        source, target, subtitle = root / "source.mp4", root / "clip.mp4", root / "clip.srt"
+        source.write_bytes(b"original recording")
+        subtitle.write_text("1\n00:00:00,200 --> 00:00:00,800\nCLIP ZERO\n", encoding="utf-8")
+        info = {"duration": 4000, "streams": [{"codec_type": "video"}, {"codec_type": "audio"}]}
+        poc = "[h264 @ 000001] co located POCs unavailable\n"
+        mmco = "[h264 @ 000002] mmco: unref short failure\n"
+        cases = [
+            ("fast", 5, 0, "", (0, "", ""), True, 1),
+            ("poc-exit-zero", 5, 0, poc, (0, "", ""), True, 2),
+            ("mmco-nonzero", 3000, 1, mmco, (0, "", ""), True, 2),
+            ("not-a-seek", 0, 0, poc, (0, "", ""), False, 1),
+            ("unrelated-error", 5, 1, "Permission denied", (0, "", ""), False, 1),
+            ("other-decoder", 5, 0, "[aac @ 1] co located POCs unavailable", (0, "", ""), False, 1),
+            ("still-damaged", 5, 0, poc, (0, "", mmco), False, 2),
+            ("failed-retry", 5, 0, poc, (1, "", ""), False, 2),
+            ("missing-retry", 5, 0, poc, (0, "", ""), False, 2),
+            ("failed-validation", 5, 0, poc, (0, "", ""), False, 2),
+            ("timed-out", 5, 0, poc, RuntimeError("transcode timeout"), False, 2),
+        ]
+        for name, start, first_code, first_error, retry, success, attempts in cases:
+            target.write_bytes(b"previous complete output")
+            calls = []
+
+            def run(args, timeout):
+                calls.append((args, timeout))
+                assert "-xerror" in args and "-abort_on" in args
+                output = Path(args[-1])
+                if len(calls) == 1:
+                    output.write_bytes(b"partial fast seek output")
+                    return first_code, "", first_error
+                assert not output.exists(), "the first attempt's partial output survived"
+                if isinstance(retry, Exception):
+                    raise retry
+                if name != "missing-retry":
+                    output.write_bytes(b"sequential output")
+                return retry
+
+            with patch.object(renderer, "media_info", return_value=info), patch.object(renderer, "_run", side_effect=run), patch.object(renderer, "validate_media", side_effect=RuntimeError("bad decoded output") if name == "failed-validation" else None) as validate:
+                try:
+                    renderer.clip(source, target, start, start + 2, subtitle)
+                except RuntimeError:
+                    assert not success, name
+                    assert target.read_bytes() == b"previous complete output", name
+                else:
+                    assert success, name
+                    validate.assert_called_once_with(Path(calls[-1][0][-1]), 2, audio=True, decode=attempts == 2)
+                    assert target.read_bytes() == (b"sequential output" if attempts == 2 else b"partial fast seek output")
+            assert len(calls) == attempts, (name, len(calls))
+            assert "-ss" in calls[0][0] and calls[0][1] == 1800
+            if attempts == 2:
+                args, timeout = calls[1]
+                assert "-ss" not in args and timeout == max(1800, (start + 2) * 2)
+                assert args[args.index("-vf") + 1].startswith(f"trim=start={start:.3f},setpts=PTS-{start:.3f}/TB,subtitles=")
+                assert args[args.index("-af") + 1] == f"atrim=start={start:.3f},asetpts=PTS-{start:.3f}/TB"
+            assert source.read_bytes() == b"original recording"
+            assert not list(root.glob(".clip-*")), name
+        for start, end in ((-1, 2), (2, 2), (3, 2), (float("nan"), 2), (0, float("inf"))):
+            with patch.object(renderer, "_run") as run:
+                try:
+                    renderer.clip(source, target, start, end)
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError((start, end))
+                run.assert_not_called()
+    print("Clip seek guards passed: one selective retry, strict decoding, local subtitle clock, bounded timeout and atomic outputs")
+
+
+def assert_clip_seek_with_ffmpeg(output_dir: Path, ffmpeg_path: str | None = None) -> None:
+    """Intact open-GOP media reproduces the reported POC error without mocks."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    settings = app.Settings(base_dir=str(output_dir), render_font_name="Arial")
+    if ffmpeg_path:
+        settings.ffmpeg_path = ffmpeg_path
+        settings.ffprobe_path = str(Path(ffmpeg_path).with_name("ffprobe.exe" if app.os.name == "nt" else "ffprobe"))
+    renderer = app.FFmpeg(settings)
+    renderer.ensure_tools()
+
+    def run(args):
+        code, stdout, stderr = renderer._run([settings.ffmpeg_path, "-hide_banner", "-v", "error", "-nostdin", "-xerror", "-y", *args], 90)
+        assert code == 0 and not stderr.strip(), (code, stderr[:1500])
+        return stdout
+
+    source = output_dir / "open-gop.mp4"
+    run(["-f", "lavfi", "-i", "testsrc2=s=320x180:r=30:d=12", "-f", "lavfi", "-i", "aevalsrc=sin(2*PI*(440+20*t)*t):s=48000:d=12",
+         "-c:v", "libx264", "-preset", "veryfast", "-g", "60", "-bf", "3", "-x264-params", "open-gop=1:scenecut=0:b-adapt=0", "-c:a", "aac", str(source)])
+    transport, silent = source.with_suffix(".ts"), output_dir / "silent.mp4"
+    run(["-i", str(source), "-c", "copy", str(transport)])
+    run(["-i", str(source), "-map", "0:v:0", "-c", "copy", str(silent)])
+    normal = output_dir / "closed-gop.mp4"
+    run(["-i", str(source), "-c:v", "libx264", "-preset", "veryfast", "-g", "60", "-bf", "3", "-x264-params", "open-gop=0:scenecut=0:b-adapt=0", "-c:a", "copy", str(normal)])
+    outputs = {}
+    for media in (source, transport, silent, normal):
+        before = hashlib.sha256(media.read_bytes()).digest()
+        assert "frame=360" in run(["-i", str(media), "-map", "0:v:0", "-map", "0:a:0?", "-progress", "pipe:1", "-f", "null", "-"])
+        expected_attempts = 1 if media == normal else 2
+        target = output_dir / (media.stem + "-" + media.suffix[1:] + "-clip.mp4")
+        with patch.object(renderer, "_run", wraps=renderer._run) as calls:
+            renderer.clip(media, target, 5.1, 7.1)
+        commands = [call.args[0] for call in calls.call_args_list if "-c:v" in call.args[0]]
+        assert len(commands) == expected_attempts, (media.name, len(commands))
+        renderer.validate_media(target, 2, audio=media != silent, decode=True)
+        reference = target.with_name(target.stem + "-reference.mp4")
+        # AAC priming differs by seek mode. Compare the unchanged fast path with
+        # its original command, and the repaired path with sequential output seek.
+        seek = ["-ss", "5.100", "-i", str(media)] if media == normal else ["-i", str(media), "-ss", "5.100"]
+        run([*seek, "-t", "2.000", "-map", "0:v:0", "-map", "0:a:0?", "-sn",
+             "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", "-movflags", "+faststart", str(reference)])
+        for stream in (("0:v:0",) if media == silent else ("0:v:0", "0:a:0")):
+            hashes = [run(["-i", str(path), "-map", stream, "-f", "framemd5", "-"]).splitlines()[10:] for path in (target, reference)]
+            assert hashes[0] == hashes[1], (media.name, stream, "frames, samples or timestamps differ from sequential reference")
+        assert hashlib.sha256(media.read_bytes()).digest() == before
+        outputs[media] = target
+
+    subtitle = output_dir / "subtitle ' [timing].srt"
+    subtitle.write_text("1\n00:00:00,200 --> 00:00:00,800\nCLIP ZERO\n", encoding="utf-8")
+    subtitled = output_dir / "subtitled.mp4"
+    renderer.clip(transport, subtitled, 5.1, 7.1, subtitle)
+    renderer.validate_media(subtitled, 2, audio=True, decode=True)
+    for timestamp, visible in ((0.1, False), (0.4, True), (1.5, False)):
+        frames = []
+        for media in (outputs[transport], subtitled):
+            result = subprocess.run([settings.ffmpeg_path, "-hide_banner", "-v", "error", "-nostdin", "-ss", str(timestamp), "-i", str(media), "-frames:v", "1",
+                                     "-vf", "crop=320:90:0:90", "-pix_fmt", "gray", "-f", "rawvideo", "-"], capture_output=True, timeout=30,
+                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            assert result.returncode == 0 and not result.stderr.strip() and len(result.stdout) == 320 * 90
+            frames.append(result.stdout)
+        changed = sum(abs(a - b) > 40 for a, b in zip(*frames))
+        assert (changed > 100) if visible else (changed < 30), (timestamp, changed, visible)
+
+    packets = json.loads(renderer._run([settings.ffprobe_path, "-v", "error", "-select_streams", "v:0", "-show_packets", "-show_entries", "packet=pos,size", "-of", "json", str(source)], 30)[1])["packets"]
+    packet = packets[len(packets) // 2]
+    data = bytearray(source.read_bytes())
+    pos, size = int(packet["pos"]), int(packet["size"])
+    data[pos + 6:pos + size] = b"\0" * (size - 6)
+    damaged = output_dir / "damaged-middle.mp4"
+    damaged.write_bytes(data)
+    protected = output_dir / "protected.mp4"
+    original = outputs[source].read_bytes()
+    protected.write_bytes(original)
+    try:
+        renderer.clip(damaged, protected, 5.1, 7.1)
+    except RuntimeError as exc:
+        assert "从头解码重试仍未通过" in str(exc), str(exc)
+    else:
+        raise AssertionError("actual source corruption passed strict sequential retry")
+    assert protected.read_bytes() == original and damaged.read_bytes() == data
+    assert not list(output_dir.glob(".clip-*"))
+    print(f"Clip seek media passed: open/closed GOP, MP4/TS, B-frames, exact frames/audio/timestamps, subtitle pixels, silent video and real corruption rejection; {output_dir}")
 
 
 def assert_recording_media_with_ffmpeg(output_dir: Path) -> None:
@@ -200,6 +508,94 @@ def assert_recording_media_with_ffmpeg(output_dir: Path) -> None:
             assert [packet["data_hash"] for packet in packets(target, "a")] == [packet["data_hash"] for packet in audio_packets[:-1]]
         assert damaged.read_bytes() == before, "repair modified the original media"
         assert not list(output_dir.glob(".recording-merge-*"))
+    for codec in ("libx264", "libx265"):
+        clean_video = output_dir / f"clean-{codec}.mp4"
+        args = ["-f", "lavfi", "-i", "testsrc2=s=160x90:r=30:d=3", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=3",
+                "-c:v", codec, "-preset", "ultrafast", "-bf", "0", "-c:a", "aac"]
+        if codec == "libx265":
+            args += ["-x265-params", "log-level=error:pools=1:frame-threads=1"]
+        run(args + [str(clean_video)])
+        video_packets = packets(clean_video, "v")
+        # Concat may insert codec headers into the first packet; compare equal mux paths.
+        baseline = output_dir / f"baseline-{codec}.mp4"
+        renderer.merge_recording_parts([clean_video], baseline)
+        video_hashes = [packet["data_hash"] for packet in packets(baseline, "v")]
+        audio_hashes = [packet["data_hash"] for packet in packets(baseline, "a")]
+        for label, indices, recoverable in (("tail", [-1], True), ("middle", [len(video_packets) // 2], False), ("two-tail", [-2, -1], False)):
+            damaged = output_dir / f"damaged-{codec}-{label}.mp4"
+            data = bytearray(clean_video.read_bytes())
+            for index in indices:
+                packet = video_packets[index]
+                pos, size = int(packet["pos"]), int(packet["size"])
+                # Keep the NAL length/header intact so demuxing still exposes the bad packet.
+                data[pos + 6:pos + size] = b"\0" * (size - 6)
+            damaged.write_bytes(data)
+            before = damaged.read_bytes()
+            target = output_dir / f"repaired-{codec}-{label}.mp4"
+            target.write_bytes(original)
+            try:
+                renderer.merge_recording_parts([damaged], target)
+            except RuntimeError:
+                assert not recoverable, f"terminal {codec} packet was not repaired"
+                assert target.read_bytes() == original
+            else:
+                assert recoverable, f"non-terminal {codec} corruption was accepted"
+                assert [packet["data_hash"] for packet in packets(target, "v")] == video_hashes[:-1]
+                assert [packet["data_hash"] for packet in packets(target, "a")] == audio_hashes
+            assert damaged.read_bytes() == before
+            assert not list(output_dir.glob(".recording-merge-*"))
+    clock_ts = output_dir / "90khz-clock.ts"
+    run(["-f", "lavfi", "-i", "testsrc2=s=320x180:r=30:d=2", "-f", "lavfi", "-i", "sine=sample_rate=48000:duration=2",
+         "-vf", "settb=1/90000,setpts='N*3000+mod(N,7)'", "-enc_time_base:v", "1/90000", "-fps_mode:v", "passthrough",
+         "-c:v", "libx264", "-preset", "ultrafast", "-bf", "0", "-c:a", "aac", str(clock_ts)])
+    clock_merged = output_dir / "90khz-normalized.mp4"
+    media_info = renderer.media_info
+
+    def transport_clock(path):
+        info = media_info(path)
+        if path == clock_ts:
+            # Reproduce the observed live probe metadata; all media processing stays real.
+            info["streams"][0].update(r_frame_rate="90000/1", avg_frame_rate="0/0")
+        return info
+
+    with patch.object(renderer, "media_info", side_effect=transport_clock):
+        renderer.merge_recording_parts([clock_ts, reversed_hevc], clock_merged)
+    clock_info = renderer.media_info(clock_merged)
+    assert 100 < int(clock_info["streams"][0]["nb_frames"]) < 140, clock_info
+
+    def invalid_average(path):
+        info = media_info(path)
+        if path.name == "0000.mp4":
+            info["streams"][0]["avg_frame_rate"] = "90000/1"
+        return info
+
+    before = clock_merged.read_bytes()
+    with patch.object(renderer, "media_info", side_effect=invalid_average):
+        try:
+            renderer.merge_recording_parts([clock_ts, reversed_hevc], clock_merged)
+        except RuntimeError as exc:
+            assert "平均帧率" in str(exc)
+        else:
+            raise AssertionError("absurd average frame rate was accepted")
+    assert clock_merged.read_bytes() == before
+    graceful = output_dir / "graceful-stop.ts"
+    with (output_dir / "graceful-stop.log").open("wb") as log:
+        process = subprocess.Popen([renderer.settings.ffmpeg_path, "-hide_banner", "-loglevel", "warning", "-stdin",
+                                    "-re", "-f", "lavfi", "-i", "testsrc2=s=160x90:r=30", "-re", "-f", "lavfi", "-i", "sine=sample_rate=48000",
+                                    "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-y", str(graceful)],
+                                   stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=log, bufsize=0,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+        try:
+            time.sleep(2)
+            app.RecorderService._stop_process(process)
+            assert process.returncode == 0 and process.stdin.closed
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=10)
+    assert graceful.stat().st_size % 188 == 0, "graceful stop left a truncated TS packet"
+    renderer.merge_recording_parts([graceful], output_dir / "graceful-stop.mp4")
+    assert_clip_seek_with_ffmpeg(output_dir / "clip-seek")
     print(f"media-check passed: real AVC/HEVC, resolution/frame-rate changes, reversed streams, audio/video timeline and preserved outputs; {output_dir}")
 
 
@@ -3490,7 +3886,10 @@ if __name__ == "__main__":
     check_rules()
     assert_editorial_highlights()
     assert_llm_transient_recovery()
+    assert_media_resource_limits()
     assert_media_failure_guards()
+    assert_recording_stop_guards()
+    assert_clip_seek_guards()
     assert_hikami_glossary_workflow()
     assert_hikami_search_transport()
     assert_streamer_knowledge()
