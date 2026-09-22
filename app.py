@@ -5083,7 +5083,7 @@ class FFmpeg:
             raise RuntimeError("FFprobe 未返回有效时长") from exc
 
     def media_info(self, path: Path) -> dict[str, Any]:
-        entries = "stream=codec_type,codec_name,profile,width,height,pix_fmt,sample_aspect_ratio,r_frame_rate,avg_frame_rate,time_base,sample_rate,channels,channel_layout,extradata_hash,start_time,duration,nb_frames:format=duration"
+        entries = "stream=codec_type,codec_name,profile,width,height,pix_fmt,sample_aspect_ratio,r_frame_rate,avg_frame_rate,time_base,sample_rate,channels,channel_layout,extradata_hash,start_time,duration,nb_frames:stream_tags=rotate:stream_side_data=rotation:format=duration"
         code, stdout, stderr = self._run([self.settings.ffprobe_path, "-v", "error", "-show_entries", entries, "-show_data_hash", "sha256", "-of", "json", str(path)], 60)
         if code != 0:
             raise RuntimeError(f"读取媒体信息失败：{path.name}：{stderr[:500]}")
@@ -5648,7 +5648,27 @@ class FFmpeg:
             if stage is not None:
                 shutil.rmtree(stage, ignore_errors=True)
 
-    def subtitle_filter(self, subtitle_path: Path, font_file: Path | None = None) -> str:
+    @staticmethod
+    def _portrait_panel_width(video_stream: dict[str, Any] | None) -> int:
+        """Width of the full portrait image on a 1920x1080 canvas; zero for landscape."""
+        if video_stream is None:
+            return 0
+        width, height = int(video_stream["width"]), int(video_stream["height"])
+        if width <= 0 or height <= 0:
+            raise ValueError("无法按无效的视频尺寸适配字幕")
+        sar = str(video_stream.get("sample_aspect_ratio") or "1:1").split(":")
+        # FFprobe reports unknown pixel aspect ratios as N/A or 0:1.
+        if len(sar) == 2 and int(sar[0]) > 0 and int(sar[1]) > 0:
+            width *= int(sar[0]) / int(sar[1])
+        rotation = next((item["rotation"] for item in video_stream.get("side_data_list", []) if "rotation" in item),
+                        (video_stream.get("tags") or {}).get("rotate", 0))
+        if round(float(rotation)) % 180 == 90:
+            width, height = height, width
+        # An even width keeps the image boundary aligned with 4:2:0 chroma samples.
+        return max(2, round(1080 * width / height / 2) * 2) if height > width else 0
+
+    def subtitle_filter(self, subtitle_path: Path, font_file: Path | None = None, *, video_stream: dict[str, Any] | None = None) -> str:
+        panel_width = self._portrait_panel_width(video_stream)
         font_name = normalize_font_name(getattr(self.settings, "render_font_name", ""))
         if font_file is None:
             font_file = self._configured_font_file()
@@ -5663,13 +5683,13 @@ class FFmpeg:
                 f"FontName={font_name}",
                 f"FontSize={int(getattr(self.settings, 'subtitle_font_size', 66))}",
                 "Bold=1",
-                f"PrimaryColour={ass_color(getattr(self.settings, 'subtitle_color', '#FFFFFF'))}",
-                f"OutlineColour={ass_color(getattr(self.settings, 'subtitle_outline_color', '#000000'), '#000000')}",
+                f"PrimaryColour={ass_color('#FFFFFF' if panel_width else getattr(self.settings, 'subtitle_color', '#FFFFFF'))}",
+                f"OutlineColour={ass_color('#94A368' if panel_width else getattr(self.settings, 'subtitle_outline_color', '#000000'), '#000000')}",
                 f"Outline={int(getattr(self.settings, 'subtitle_outline_width', 6))}",
                 "Shadow=0",
-                f"Alignment={int(getattr(self.settings, 'subtitle_alignment', 2))}",
+                f"Alignment={10 if panel_width else int(getattr(self.settings, 'subtitle_alignment', 2))}",
                 f"MarginV={int(getattr(self.settings, 'subtitle_margin_v', 24))}",
-                f"MarginL={int(getattr(self.settings, 'subtitle_margin_l', 30))}",
+                f"MarginL={round(panel_width * 2 / 3) + int(getattr(self.settings, 'subtitle_margin_l', 30))}",
                 f"MarginR={int(getattr(self.settings, 'subtitle_margin_r', 30))}",
             )
         )
@@ -5684,14 +5704,17 @@ class FFmpeg:
             raise ValueError("切片起止时间无效")
         destination.parent.mkdir(parents=True, exist_ok=True)
         duration = max(0.1, end - start)
-        audio = any(stream["codec_type"] == "audio" for stream in self.media_info(source)["streams"])
+        streams = self.media_info(source)["streams"]
+        audio = any(stream["codec_type"] == "audio" for stream in streams)
+        video = next(stream for stream in streams if stream["codec_type"] == "video")
+        panel_width = self._portrait_panel_width(video)
         with tempfile.TemporaryDirectory(prefix=".clip-", dir=str(destination.parent)) as folder, self._filter_assets() as prepare:
             temporary = Path(folder) / "clip.mp4"
             subtitle = ""
             if subtitle_path is not None and subtitle_path.is_file() and subtitle_path.stat().st_size > 0:
                 # libass must see only the selected file, not every font in Windows/Fonts.
                 font_file = prepare(self._configured_font_file(), isolate_font=True)
-                subtitle = self.subtitle_filter(prepare(subtitle_path), font_file)
+                subtitle = self.subtitle_filter(prepare(subtitle_path), font_file, video_stream=video)
             for sequential in (False, True):
                 args = [self.settings.ffmpeg_path, "-hide_banner", "-loglevel", "error", "-nostdin", "-xerror", "-abort_on", "empty_output_stream", "-y"]
                 if not sequential:
@@ -5700,6 +5723,8 @@ class FFmpeg:
                 # Open GOP seeks can lose references even in intact media. Retry once
                 # from the beginning, resetting both clocks before clip-relative subtitles.
                 filters = [f"trim=start={start:.3f}", f"setpts=PTS-{start:.3f}/TB"] if sequential else []
+                if panel_width:
+                    filters.extend([f"scale={panel_width}:1080", "setsar=1", "pad=1920:1080:0:0:color=black"])
                 if subtitle:
                     filters.append(subtitle)
                 if filters:
@@ -13225,7 +13250,7 @@ def run_self_test() -> None:
             self.font_contents: list[list[bytes]] = []
 
         def media_info(self, path: Path) -> dict[str, Any]:
-            return {"duration": 2.0, "streams": [{"codec_type": "video"}, {"codec_type": "audio"}]}
+            return {"duration": 2.0, "streams": [{"codec_type": "video", "width": 1280, "height": 720}, {"codec_type": "audio"}]}
 
         def _run(self, args: list[str], timeout: int | None = None) -> tuple[int, str, str]:
             del timeout
@@ -13275,6 +13300,29 @@ def run_self_test() -> None:
         assert "Bold=1" in clip_filter and "PlayResX=1280,PlayResY=720" in clip_filter
         assert "OutlineColour=&H00214365" in clip_filter and "Alignment=10" in clip_filter
         assert "MarginL=40" in clip_filter and "MarginR=50" in clip_filter
+        landscape_filter = renderer.subtitle_filter(subtitle)
+        for width, height in ((640, 360), (1920, 1080), (1440, 1080), (1080, 1080)):
+            assert renderer.subtitle_filter(subtitle, video_stream={"width": width, "height": height}) == landscape_filter
+            assert renderer._portrait_panel_width({"width": width, "height": height}) == 0
+        portrait_filter = renderer.subtitle_filter(subtitle, video_stream={"width": 1080, "height": 1920})
+        assert portrait_filter == landscape_filter.replace("PrimaryColour=&H00563412", "PrimaryColour=&H00FFFFFF").replace("OutlineColour=&H00214365", "OutlineColour=&H0068A394").replace("MarginL=40", "MarginL=445")
+        for video in (
+            {"width": 360, "height": 640},
+            {"width": 720, "height": 1280, "sample_aspect_ratio": "0:1"},
+            {"width": 540, "height": 1920, "sample_aspect_ratio": "2:1"},
+            {"width": 1920, "height": 1080, "side_data_list": [{"rotation": -90}]},
+            {"width": 1920, "height": 1080, "tags": {"rotate": "90"}},
+        ):
+            assert renderer.subtitle_filter(subtitle, video_stream=video) == portrait_filter, video
+            assert renderer._portrait_panel_width(video) == 608, video
+        assert renderer.subtitle_filter(subtitle, video_stream={"width": 1080, "height": 1920, "side_data_list": [{"rotation": 90}]}) == landscape_filter
+        for width, height in ((0, 1920), (1080, -1)):
+            try:
+                renderer.subtitle_filter(subtitle, video_stream={"width": width, "height": height})
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("invalid subtitle dimensions accepted")
         assert renderer.font_contents == [[b"font"]]
         assert renderer.font_directories[0] != custom_font.parent
         assert not renderer.font_directories[0].exists(), "isolated font directory leaked"

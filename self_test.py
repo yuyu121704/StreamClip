@@ -247,7 +247,7 @@ def assert_clip_seek_guards() -> None:
         source, target, subtitle = root / "source.mp4", root / "clip.mp4", root / "clip.srt"
         source.write_bytes(b"original recording")
         subtitle.write_text("1\n00:00:00,200 --> 00:00:00,800\nCLIP ZERO\n", encoding="utf-8")
-        info = {"duration": 4000, "streams": [{"codec_type": "video"}, {"codec_type": "audio"}]}
+        info = {"duration": 4000, "streams": [{"codec_type": "video", "width": 1080, "height": 1920}, {"codec_type": "audio"}]}
         poc = "[h264 @ 000001] co located POCs unavailable\n"
         mmco = "[h264 @ 000002] mmco: unref short failure\n"
         cases = [
@@ -292,11 +292,15 @@ def assert_clip_seek_guards() -> None:
                     validate.assert_called_once_with(Path(calls[-1][0][-1]), 2, audio=True, decode=attempts == 2)
                     assert target.read_bytes() == (b"sequential output" if attempts == 2 else b"partial fast seek output")
             assert len(calls) == attempts, (name, len(calls))
+            for args, _ in calls:
+                filters = args[args.index("-vf") + 1]
+                assert "scale=608:1080,setsar=1,pad=1920:1080:0:0:color=black,subtitles=" in filters, "portrait layout lost on seek/retry"
+                assert "Alignment=10" in filters and "MarginL=435" in filters and "OutlineColour=&H0068A394" in filters
             assert "-ss" in calls[0][0] and calls[0][1] == 1800
             if attempts == 2:
                 args, timeout = calls[1]
                 assert "-ss" not in args and timeout == max(1800, (start + 2) * 2)
-                assert args[args.index("-vf") + 1].startswith(f"trim=start={start:.3f},setpts=PTS-{start:.3f}/TB,subtitles=")
+                assert args[args.index("-vf") + 1].startswith(f"trim=start={start:.3f},setpts=PTS-{start:.3f}/TB,scale=608:1080,")
                 assert args[args.index("-af") + 1] == f"atrim=start={start:.3f},asetpts=PTS-{start:.3f}/TB"
             assert source.read_bytes() == b"original recording"
             assert not list(root.glob(".clip-*")), name
@@ -3527,6 +3531,78 @@ def assert_reference_rendering_with_ffmpeg(output_dir: Path) -> None:
             assert white(frame(clip, 1.2)).getbbox() is None, "next sentence appeared during the pause"
     for bounds in normalized_bounds:
         assert all(abs(a - b) <= 3 for a, b in zip(bounds, normalized_bounds[1])), normalized_bounds
+
+    portrait_subtitle = output_dir / "portrait.srt"
+    portrait_subtitle.write_text(app.build_srt_from_segments([
+        {"start": 0, "end": 1, "text": "就是告诉你可以把呃塑料袋绑在呃树梢上"},
+        {"start": 1.4, "end": 2, "text": "老绿在家在家找，"},
+    ], include_labels=False), encoding="utf-8")
+    portrait_bounds = []
+    # Include tall phones, 3:4 video, anamorphic pixels and both rotation directions.
+    for name, width, height, sar, rotation, panel_width in (
+        ("360", 360, 640, "1/1", 0, 608),
+        ("720", 720, 1280, "1/1", 0, 608),
+        ("1080", 1080, 1920, "1/1", 0, 608),
+        ("3-4", 600, 800, "1/1", 0, 810),
+        ("1-2", 480, 960, "1/1", 0, 540),
+        ("sar", 360, 1280, "2/1", 0, 608),
+        ("rotated", 1280, 720, "1/1", 90, 608),
+        ("rotated-back", 720, 1280, "1/1", -90, 0),
+    ):
+        source = output_dir / f"portrait-source-{name}.mp4"
+        run([
+            settings.ffmpeg_path, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+            "-f", "lavfi", "-i", f"color=c=0x444444:s={width}x{height}:r=10:d=2",
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=2",
+            "-vf", f"setsar={sar}", "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-shortest", str(source),
+        ])
+        if rotation:
+            rotated = source.with_stem(source.stem + "-metadata")
+            run([settings.ffmpeg_path, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+                 "-display_rotation:v:0", str(rotation), "-i", str(source), "-c", "copy", str(rotated)])
+            source = rotated
+            video = next(stream for stream in renderer.media_info(source)["streams"] if stream["codec_type"] == "video")
+            assert any(abs(item.get("rotation", 0)) == 90 for item in video.get("side_data_list", [])), "rotation fixture has no display matrix"
+        clip = output_dir / f"portrait-clip-{name}.mp4"
+        renderer.clip(source, clip, 0, 2, portrait_subtitle)
+        renderer.validate_media(clip, 2, audio=True, decode=True)
+        image = frame(clip, 0.4)
+        bounds = white(image).getbbox()
+        assert bounds is not None, (name, "missing portrait subtitles")
+        image.save(output_dir / f"portrait-preview-{name}.png")
+        if not panel_width:
+            assert image.size == (1280, 720) and 640 <= bounds[1] < bounds[3] <= 700, (name, bounds)
+            assert abs((bounds[0] + bounds[2]) / 2 - 640) <= 3, (name, bounds)
+            continue
+        assert image.size == (1920, 1080), (name, image.size)
+        assert bounds[0] >= panel_width + 35 and bounds[2] <= 1885, (name, "subtitles escaped right panel", bounds)
+        assert abs((bounds[0] + bounds[2]) / 2 - (panel_width + 1920) / 2) <= 5, (name, "horizontal center", bounds)
+        assert abs((bounds[1] + bounds[3]) / 2 - 540) <= 24, (name, "vertical center", bounds)
+        assert 45 <= bounds[3] - bounds[1] <= 185, (name, "long cue must fit in at most two lines", bounds)
+        assert all(abs(channel - 68) <= 4 for channel in image.getpixel((panel_width // 2, 540))), "portrait image is missing"
+        assert white(image.crop((0, 0, panel_width, 1080))).getbbox() is None, "subtitles cover the portrait image"
+        red, green, blue = image.split()
+        outline = ImageChops.multiply(ImageChops.multiply(
+            red.point(lambda v: 255 if 100 < v < 190 else 0),
+            green.point(lambda v: 255 if 125 < v < 200 else 0)),
+            blue.point(lambda v: 255 if 60 < v < 140 else 0)).getbbox()
+        assert outline and outline[0] < bounds[0] - 4 and outline[2] > bounds[2] + 4, (name, "green outline missing", outline, bounds)
+        assert white(frame(clip, 1.2)).getbbox() is None, (name, "subtitle shown during pause")
+        blank_panel = frame(clip, 1.2).crop((panel_width + 12, 0, 1920, 1080))
+        assert max(high for _, high in blank_panel.getextrema()) <= 5, (name, "right panel is not black during pause")
+        short = white(frame(clip, 1.6)).getbbox()
+        assert short is not None and short[2] - short[0] < bounds[2] - bounds[0], (name, "second cue missing")
+        assert 45 <= short[3] - short[1] <= 85 and abs((short[1] + short[3]) / 2 - 540) <= 24, (name, short)
+        if name in {"360", "720", "1080"}:
+            portrait_bounds.append(bounds)
+        if name == "720":
+            silent_subtitles = output_dir / "portrait-no-subtitles.mp4"
+            renderer.clip(source, silent_subtitles, 0, 2)
+            blank = frame(silent_subtitles, 0.4)
+            assert blank.size == (1920, 1080) and white(blank).getbbox() is None
+            assert max(high for _, high in blank.crop((620, 0, 1920, 1080)).getextrema()) <= 5
+    for bounds in portrait_bounds:
+        assert all(abs(a - b) <= 2 for a, b in zip(bounds, portrait_bounds[1])), portrait_bounds
 
     source = output_dir / "source-720.mp4"
     # Measured from three public covers, not from the implementation.
