@@ -52,6 +52,14 @@ ApplicationWindow {
     property int confirmationId: 0
     property string confirmationTitle: ""
     property string confirmationUpdateVersion: ""
+    property var cleanupSelection: ({ids: []})
+    property var cleanupReport: ({message: "", failed: []})
+    function confirmCleanup(kind) {
+        const selection = bridge.cleanupSelection(kind)
+        if (bridge.busy || !selection.ids || !selection.ids.length) return
+        cleanupSelection = selection
+        cleanupDialog.open()
+    }
     readonly property var navigationOrder: [2, 3, 0, 4, 5, 1, 6, 7, 8]
     readonly property var pageIcons: ["clapperboard", "list-checks", "house", "radio", "scissors", "send", "user-round", "settings-2", "refresh-cw"]
     onActiveChanged: if (active) bridge.refreshMotionPreference()
@@ -79,6 +87,12 @@ ApplicationWindow {
         target: bridge
         function onError(message) { errorMessage.text = message; errorDialog.open() }
         function onClosed() { window.allowClose = true; window.close() }
+        function onActionDone(action, data) {
+            if (action !== "cleanup") return
+            if (data.kind === "tasks") window.selectedTask = 0
+            window.cleanupReport = data
+            cleanupResultDialog.open()
+        }
         function onMotionChanged() {
             if (!bridge.motionEnabled) {
                 pageReveal.complete()
@@ -291,6 +305,17 @@ ApplicationWindow {
                                 deleteRecordingDialog.open()
                             }
                         }
+                        Item { Layout.fillWidth: true }
+                        Action {
+                            objectName: "clearRecordingsButton"
+                            text: "一键删除"
+                            symbol: "trash"
+                            destructive: true
+                            enabled: !bridge.busy && recordingModel.filters.count > 0
+                            ToolTip.visible: hovered
+                            ToolTip.text: "删除当前筛选范围内的录播及相关文件"
+                            onClicked: window.confirmCleanup("recordings")
+                        }
                     }
                     MediaFilters { Layout.fillWidth: true; library: recordingModel; namePrefix: "recording" }
                     RowLayout {
@@ -396,6 +421,17 @@ ApplicationWindow {
                         Action { text: "取消选中"; enabled: window.selectedTask > 0 && !bridge.busy; onClicked: bridge.command("cancel", String(window.selectedTask)) }
                         Action { text: "重试选中"; symbol: "rotate-ccw"; enabled: window.selectedTask > 0 && !bridge.busy; onClicked: bridge.command("retry", String(window.selectedTask)) }
                         Action { text: "批量重试失败"; enabled: !bridge.busy; onClicked: bridge.command("retryFailed", "") }
+                        Item { Layout.fillWidth: true }
+                        Action {
+                            objectName: "clearTasksButton"
+                            text: "一键清理"
+                            symbol: "trash"
+                            destructive: true
+                            enabled: !bridge.busy && (bridge.workspace.finishedTaskCount || 0) > 0
+                            ToolTip.visible: hovered
+                            ToolTip.text: "清理已完成、失败和已取消的任务记录"
+                            onClicked: window.confirmCleanup("tasks")
+                        }
                     }
                     Label { textFormat: Text.PlainText; text: "下载、分析、切片和投稿均保留进度，重启后可恢复。"; color: uiTheme.current.colors.muted }
                     Panel {
@@ -443,6 +479,7 @@ ApplicationWindow {
                         onWidthChanged: if (window.page >= 2 && window.page < 8) retainedWidth = width
                         onHeightChanged: if (window.page >= 2 && window.page < 8) retainedHeight = height
                         onNavigate: function(target) { window.page = target }
+                        onCleanupRequested: function(kind) { window.confirmCleanup(kind) }
                     }
                 }
                 VersionPage {
@@ -492,6 +529,69 @@ ApplicationWindow {
         anchors.fill: parent
         target: appSurface
         artReady: headerArtwork.status === Image.Ready && workspacePages.artReady
+    }
+    AppDialog {
+        id: cleanupDialog
+        objectName: "cleanupDialog"
+        title: window.cleanupSelection.kind === "tasks" ? "清理已结束任务" : "批量删除" + (window.cleanupSelection.kind === "recordings" ? "录播" : "切片")
+        destructive: true
+        anchors.centerIn: parent
+        width: Math.min(560, window.width - 32)
+        modal: true
+        standardButtons: Dialog.Yes | Dialog.No
+        onOpened: {
+            standardButton(Dialog.Yes).text = window.cleanupSelection.kind === "tasks" ? "清理任务记录" : "删除这些文件"
+            standardButton(Dialog.No).text = "取消"
+            standardButton(Dialog.No).forceActiveFocus()
+        }
+        onAccepted: {
+            if (bridge.busy) return
+            if (window.cleanupSelection.kind === "clips") workspacePages.releaseCleanupClip(window.cleanupSelection.ids)
+            bridge.perform("cleanup", window.cleanupSelection)
+        }
+        Label {
+            objectName: "cleanupConfirmationText"
+            width: parent.width
+            textFormat: Text.PlainText
+            wrapMode: Text.Wrap
+            text: "范围：" + (window.cleanupSelection.scope || "") + "\n共 " + window.cleanupSelection.ids.length + " 条。\n\n" +
+                  (window.cleanupSelection.kind === "tasks"
+                   ? "将从任务列表移除已完成、失败和已取消的记录；移除后不能在此列表重试。\n\n录播、切片、投稿历史和内部去重数据保留。排队、运行中和等待确认的任务不清理。"
+                   : (window.cleanupSelection.kind === "recordings"
+                      ? "将永久删除这些录播的原视频、弹幕、字幕、总结及相关缓存。\n已有切片和投稿历史保留。"
+                      : "将永久删除这些切片的本地视频、封面、字幕和预览文件。\n原录播、投稿历史和已发布的平台稿件保留。") +
+                     "\n\n文件删除无法撤销。正在处理、被共用或删除失败的项目将保留，并报告原因。")
+        }
+    }
+    AppDialog {
+        id: cleanupResultDialog
+        objectName: "cleanupResultDialog"
+        title: "清理结果"
+        anchors.centerIn: parent
+        width: Math.min(560, window.width - 32)
+        height: window.cleanupReport.failed.length ? Math.min(420, window.height - 64) : 210
+        modal: true
+        standardButtons: Dialog.Ok
+        onOpened: { standardButton(Dialog.Ok).text = "确定"; standardButton(Dialog.Ok).forceActiveFocus() }
+        ColumnLayout {
+            anchors.fill: parent
+            Label { Layout.fillWidth: true; text: window.cleanupReport.message; textFormat: Text.PlainText; wrapMode: Text.Wrap }
+            ScrollView {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                visible: window.cleanupReport.failed.length > 0
+                contentWidth: availableWidth
+                clip: true
+                TextArea {
+                    readOnly: true
+                    selectByMouse: true
+                    textFormat: TextEdit.PlainText
+                    wrapMode: TextEdit.Wrap
+                    text: window.cleanupReport.failed.map(item => "#" + item.id + "：" + item.error).join("\n\n")
+                    background: null
+                }
+            }
+        }
     }
     AppDialog {
         id: deleteRecordingDialog

@@ -20,13 +20,15 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 
-VERSION = "2026.09.22.2"
+VERSION = "2026.09.24.2"
 REPOSITORY = "yuyu121704/StreamClip"
 RELEASES_URL = f"https://github.com/{REPOSITORY}/releases"
 API_URL = f"https://api.github.com/repos/{REPOSITORY}/releases?per_page=100"
 MAX_PACKAGE_SIZE = 1024 * 1024 * 1024
 LOCAL_HISTORY = [
-    {"version": VERSION, "date": "2026-09-22", "summary": "竖屏切片改为16:9横向排版：左侧完整人物画面，右侧黑底居中白字绿边字幕；保留字幕时间轴，横屏沿用原样式。"},
+    {"version": VERSION, "date": "2026-09-24", "summary": "录播、切片支持按当前筛选一键删除；任务支持一键清理已结束记录。确认后逐项检查，保留正在处理或删除失败的项目，以及投稿历史和任务去重数据。"},
+    {"version": "2026.09.24.1", "date": "2026-09-24", "summary": "修复直播断流后的双重重连：重新获取地址并另存分段，避免新 FLV 流续接到旧流导致包错位和坏帧；保留严格音视频校验，旧损坏录播提示先修复再重试。"},
+    {"version": "2026.09.22.2", "date": "2026-09-22", "summary": "竖屏切片改为16:9横向排版：左侧完整人物画面，右侧黑底居中白字绿边字幕；保留字幕时间轴，横屏沿用原样式。"},
     {"version": "2026.09.22.1", "date": "2026-09-22", "summary": "修复竖屏切片字幕过大：按显示宽度缩放字号和描边，保留上下边距比例，识别旋转视频；横屏字幕样式保持不变。"},
     {"version": "2026.09.20.3", "date": "2026-09-20", "summary": "降低媒体处理内存：限制 FFmpeg 解码、滤镜和编码线程，多项处理排队执行；保留分辨率、帧率、画质参数、字幕与严格校验。"},
     {"version": "2026.09.20.2", "date": "2026-09-20", "summary": "修复部分 H.264 录播从中间切片时缺少参考帧导致失败；自动从头解码重试，保留字幕时间轴和严格媒体校验。"},

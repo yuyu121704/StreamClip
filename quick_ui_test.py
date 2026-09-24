@@ -1022,6 +1022,163 @@ def check_model_connection(application, bridge, window):
         bridge.modelsReady.disconnect(results.append)
 
 
+def check_batch_cleanup(application, bridge, engine, window, folder, output):
+    db = bridge.db
+    original_record, original_clip = bridge._selected, bridge._selected_clip
+    dialog = window.findChild(QObject, "cleanupDialog")
+    result_dialog = window.findChild(QObject, "cleanupResultDialog")
+    pages = window.findChild(QObject, "workspacePages")
+    player = window.findChild(QMediaPlayer, "clipPlayer")
+    sample = (Path(folder) / "Qt播放测试.mp4").read_bytes()
+    records, clips = [], []
+    for index in range(3):
+        path = Path(folder) / f"bulk-record-{index}.mp4"
+        path.write_bytes(sample)
+        rid = db.create_recording("700001" if index < 2 else "700002", f"bulk-{index}",
+                                  "批量清理测试录播", str(path), "2026-01-02T20:00:00+08:00", source_type="local")
+        db.finish_recording(rid, "complete", str(path), ui.core.now_text(), 3)
+        records.append((rid, path))
+    for index in range(2):
+        path = Path(folder) / f"bulk-clip-{index}.mp4"
+        path.write_bytes(sample)
+        cid = db.create_clip(records[2][0], "批量清理测试切片", 0, 3, str(path))
+        if index == 0:
+            db.set_clip_status(cid, "complete")
+        clips.append((cid, path))
+    timestamp = ui.core.now_text()
+    with db._connect() as conn:
+        conn.executemany(
+            "INSERT INTO tasks(kind,unique_key,status,created_at,updated_at) VALUES('generic',?,'complete',?,?)",
+            [(f"bulk-ui-{i}", timestamp, timestamp) for i in range(505)])
+    bridge.refresh()
+    wait_for(application, lambda: not bridge._refreshing)
+    bridge.recordings.setFilter("room:700001", "2026-01-02")
+    bridge.clips.setFilter("room:700002", "2026-01-02")
+    assert len(bridge.cleanupSelection("tasks")["ids"]) >= 505, "cleanup must not stop at 500 rows"
+    record_button = window.findChild(QObject, "clearRecordingsButton")
+    clip_button = window.findChild(QObject, "clearClipsButton")
+    task_button = window.findChild(QObject, "clearTasksButton")
+    for skin in ("day", "night"):
+        engine.ui_theme.select(skin)
+        for width, height in ((1280, 820), (1020, 680)):
+            window.resize(width, height)
+            for page, button in ((0, record_button), (4, clip_button), (1, task_button)):
+                window.setProperty("page", page)
+                QTest.qWait(100)
+                assert button.property("visible") and button.property("enabled")
+                point = qml_call(button, "mapToItem(null, 0, 0)")[0]
+                assert 0 <= point.x() <= width - button.property("width")
+                assert 0 <= point.y() <= height - button.property("height")
+                assert qml_call(button, "contentItem.implicitWidth <= width - leftPadding - rightPadding")[0]
+                assert window.grabWindow().save(str(output / f"cleanup-{skin}-{page}-{width}.png"))
+                qml_call(button, "clicked()")
+                wait_for(application, lambda: dialog.property("opened"))
+                assert qml_call(dialog, "standardButton(Dialog.No).activeFocus")[0]
+                assert dialog.property("height") < height
+                if width == 1020:
+                    assert window.grabWindow().save(str(output / f"cleanup-confirm-{skin}-{page}.png"))
+                qml_call(dialog, "reject()")
+    assert all(path.exists() for _, path in records + clips), "cancel must not delete files"
+    engine.ui_theme.select("day")
+    window.setProperty("page", 0)
+    bridge.selectRecording(records[0][0])
+    wait_for(application, lambda: not bridge._refreshing)
+    qml_call(record_button, "clicked()")
+    wait_for(application, lambda: dialog.property("opened"))
+    captured = window.property("cleanupSelection")
+    assert set(captured["ids"]) == {rid for rid, _ in records[:2]}
+    # New items and changed filters while the confirmation is open must not widen its scope.
+    later_path = Path(folder) / "bulk-record-later.mp4"
+    later_path.write_bytes(sample)
+    later_id = db.create_recording("700001", "bulk-later", "确认后新增", str(later_path), "2026-01-02T21:00:00+08:00", source_type="local")
+    db.finish_recording(later_id, "complete", str(later_path), timestamp, 3)
+    bridge.refresh()
+    wait_for(application, lambda: not bridge._refreshing)
+    bridge.recordings.setFilter("room:700002", "")
+    original_unlink = Path.unlink
+    def fail_locked(path, *args, **kwargs):
+        if path == records[1][1]:
+            raise PermissionError("synthetic file lock")
+        return original_unlink(path, *args, **kwargs)
+    with patch.object(Path, "unlink", fail_locked):
+        qml_call(dialog, "accept()")
+        assert bridge.busy and not record_button.property("enabled")
+        wait_for(application, lambda: not bridge.busy and not bridge._refreshing)
+    report = window.property("cleanupReport")
+    assert report["deleted"] == [records[0][0]] and report["failed"][0]["id"] == records[1][0]
+    assert records[1][1].exists() and records[2][1].exists() and later_path.exists()
+    assert not bridge.detail["id"] and result_dialog.property("visible")
+    assert window.grabWindow().save(str(output / "cleanup-partial-result.png"))
+    qml_call(result_dialog, "close()")
+    bridge.recordings.setFilter("room:700001", "")
+    qml_call(record_button, "clicked()")
+    wait_for(application, lambda: dialog.property("opened"))
+    qml_call(dialog, "accept()")
+    wait_for(application, lambda: not bridge.busy and not bridge._refreshing)
+    assert db.get_recording(later_id)["deleted"] and db.get_recording(records[1][0])["deleted"]
+    qml_call(result_dialog, "close()")
+
+    window.setProperty("page", 4)
+    bridge.selectClip(clips[0][0])
+    wait_for(application, lambda: not bridge._refreshing and player.duration() > 0)
+    player.audioOutput().setVolume(0)
+    player.play()
+    wait_for(application, lambda: player.position() > 100)
+    qml_call(clip_button, "clicked()")
+    wait_for(application, lambda: dialog.property("opened"))
+    qml_call(dialog, "accept()")
+    wait_for(application, lambda: not bridge.busy and not bridge._refreshing)
+    report = window.property("cleanupReport")
+    assert report["deleted"] == [clips[0][0]] and report["failed"][0]["id"] == clips[1][0]
+    assert player.source().isEmpty() and not bridge.workspace["clip"] and pages.property("deletingClipId") == 0
+    assert clips[1][1].exists() and records[2][1].exists()
+    qml_call(result_dialog, "close()")
+    db.set_clip_status(clips[1][0], "complete")
+    qml_call(clip_button, "clicked()")
+    wait_for(application, lambda: dialog.property("opened"))
+    qml_call(dialog, "accept()")
+    wait_for(application, lambda: not bridge.busy and not bridge._refreshing)
+    assert db.get_clip(clips[1][0])["deleted"] and not clips[1][1].exists()
+    qml_call(result_dialog, "close()")
+
+    window.setProperty("page", 1)
+    qml_call(task_button, "clicked()")
+    wait_for(application, lambda: dialog.property("opened"))
+    captured = window.property("cleanupSelection")["ids"]
+    raced = captured[0]
+    db.update_task(raced, "running")
+    later_task, _ = db.create_task("generic", "task-after-confirmation")
+    db.update_task(later_task, "complete")
+    qml_call(dialog, "accept()")
+    wait_for(application, lambda: not bridge.busy and not bridge._refreshing)
+    assert sum(db.get_task(tid)["archived"] for tid in captured) == len(captured) - 1
+    assert not db.get_task(raced)["archived"] and not db.get_task(later_task)["archived"]
+    assert {r["id"] for r in bridge.tasks.rows}.isdisjoint(set(captured) - {raced})
+    assert bridge.workspace["stats"]["tasks"] == bridge.tasks.rowCount()
+    qml_call(result_dialog, "close()")
+    db.update_task(raced, "complete")
+    bridge.refresh()
+    wait_for(application, lambda: not bridge._refreshing)
+    qml_call(task_button, "clicked()")
+    wait_for(application, lambda: dialog.property("opened"))
+    qml_call(dialog, "accept()")
+    wait_for(application, lambda: not bridge.busy and not bridge._refreshing)
+    assert not task_button.property("enabled") and not bridge.cleanupSelection("tasks")["ids"]
+    qml_call(result_dialog, "close()")
+    for library, button, kind in ((bridge.recordings, record_button, "recordings"), (bridge.clips, clip_button, "clips")):
+        saved = library._all_rows
+        library.sync([])
+        assert not button.property("enabled") and not bridge.cleanupSelection(kind)["ids"]
+        library.sync(saved)
+        library.setFilter("", "")
+    bridge.service.delete_recording(records[2][0])
+    bridge.selectRecording(original_record)
+    bridge.selectClip(original_clip)
+    wait_for(application, lambda: not bridge._refreshing)
+    window.setProperty("page", 0)
+    print("Qt batch cleanup checks passed: filtered snapshots, cancellation, partial failures, playback release and >500 tasks")
+
+
 def wait_for(application, predicate, timeout=5):
     deadline = time.monotonic() + timeout
     while not predicate():
@@ -1753,6 +1910,7 @@ def run(motion_preference, updates_only=False):
             qml_call(window, "errorDialog.close()")
             check_media_filters(application, bridge, window, folder, output)
             check_calendar(application, bridge, window, output)
+            check_batch_cleanup(application, bridge, engine, window, folder, output)
             summary = window.findChild(QObject, "summaryText")
             qml_call(summary, "selectAll()")
             assert qml_call(summary, "selectedText.length")[0] > 0

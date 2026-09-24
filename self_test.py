@@ -149,6 +149,8 @@ def assert_media_failure_guards() -> None:
                 assert kwargs.get("creationflags", 0) & subprocess.CREATE_NO_WINDOW, "recording FFmpeg would open a console"
                 assert not kwargs["creationflags"] & subprocess.CREATE_NEW_CONSOLE
             assert "-stdin" in args and "-nostdin" not in args and kwargs["stdin"] == subprocess.PIPE
+            assert "-xerror" in args, "corrupt input must end this recording part"
+            assert not any(arg.startswith("-reconnect") for arg in args), "HTTP reconnect must not splice live FLV streams"
             assert kwargs["stdout"] == subprocess.DEVNULL and kwargs["bufsize"] == 0
             assert hasattr(kwargs["stderr"], "write"), "recording diagnostics must remain in the log"
             commands.append(args)
@@ -240,6 +242,99 @@ def assert_recording_stop_guards() -> None:
     print("Recording stop checks passed: graceful q, bounded fallback, no UI hard kill, private timeout diagnostics")
 
 
+def assert_recording_reconnect_with_ffmpeg(output_dir: Path, *, truncate_packet: bool = False) -> None:
+    """A restarted live HTTP stream must get a new demuxer and recording part."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    settings = app.Settings(base_dir=str(output_dir), danmaku_enabled=False, auto_slice=False,
+                            auto_recover_recording=False, record_retry_count=1, record_retry_delay=0)
+    settings.ensure_dirs()
+    renderer = app.FFmpeg(settings)
+    renderer.ensure_tools()
+    media = []
+    for index, color in enumerate(("red", "blue")):
+        path = output_dir / f"stream-{index}.flv"
+        code, _, error = renderer._run([
+            settings.ffmpeg_path, "-hide_banner", "-v", "error", "-nostdin", "-y",
+            "-f", "lavfi", "-i", f"color=c={color}:s=160x90:r=30:d=3",
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=3",
+            "-c:v", "libx264", "-preset", "ultrafast", "-g", "30", "-bf", "0",
+            "-c:a", "aac", "-f", "flv", str(path),
+        ], 30)
+        assert code == 0 and not error.strip(), error
+        media.append(path.read_bytes())
+    # Disconnect at a complete FLV tag, but before the advertised HTTP body ends.
+    # A live server resumes with a fresh FLV header, not the requested byte range.
+    position = 13
+    while position + 15 < len(media[0]):
+        size = int.from_bytes(media[0][position + 1:position + 4], "big")
+        timestamp = int.from_bytes(media[0][position + 4:position + 7], "big")
+        if timestamp >= 1600 and media[0][position] == 9 and size > 10:
+            break
+        position += 11 + size + 4
+    if truncate_packet:
+        position += 11 + size // 2
+    assert 13 < position < len(media[0])
+    requests = []
+
+    class LiveStream(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append((self.path, self.headers.get("Range")))
+            first = len(requests) == 1
+            data = media[0] if first else media[1]
+            self.send_response(200)
+            self.send_header("Content-Type", "video/x-flv")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(data[:position] if first else data)
+            self.wfile.flush()
+            self.close_connection = True
+
+        def log_message(self, *_):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), LiveStream)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    db = app.Database(output_dir / "app.db")
+    db.add_room("1", "Reconnect test")
+    service = app.RecorderService(settings, db, app.queue.Queue())
+    urls = [[f"http://127.0.0.1:{server.server_port}/{index}"] for index in range(2)]
+    room = {"live_status": True, "title": "Reconnect test"}
+    try:
+        with patch.object(app.BilibiliClient, "room_info", side_effect=[room, room, {"live_status": False}]), \
+                patch.object(app.BilibiliClient, "stream_urls", side_effect=urls) as refresh, \
+                patch.object(service.ffmpeg, "merge_recording_parts", wraps=service.ffmpeg.merge_recording_parts) as merge, \
+                patch.object(service, "analyze_recording") as analyze:
+            service._record_worker("1", {"stop": threading.Event()})
+            analyze.assert_not_called()
+        assert [item[0] for item in requests] == ["/0", "/1"], requests
+        assert refresh.call_count == 2
+        assert merge.call_count == 1 and len(merge.call_args.args[0]) == 2
+        record = db.list_recordings()[0]
+        assert record["status"] == "complete" and not record["error"], record["error"]
+        target = Path(record["path"])
+        renderer.validate_media(target, record["duration"], audio=True, decode=True)
+        assert 4.4 < record["duration"] < 4.9, record["duration"]
+        for timestamp, channel in ((0.5, 0), (3, 2)):
+            result = subprocess.run([
+                settings.ffmpeg_path, "-v", "error", "-nostdin", "-ss", str(timestamp), "-i", str(target),
+                "-frames:v", "1", "-vf", "scale=1:1", "-pix_fmt", "rgb24", "-f", "rawvideo", "-",
+            ], capture_output=True, timeout=30, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            assert result.returncode == 0 and not result.stderr and len(result.stdout) == 3
+            assert result.stdout[channel] > 180 and result.stdout[2 - channel] < 50
+        clip = output_dir / "across-http-reconnect.mp4"
+        renderer.clip(target, clip, 1, 3.5)
+        renderer.validate_media(clip, 2.5, audio=True, decode=True)
+        assert not list(settings.recordings_path.glob("*.ts"))
+    finally:
+        service.executor.shutdown(wait=True)
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
+    print(f"HTTP reconnect passed: fresh URL/demuxer/part, complete strict decode, both scenes and cross-reconnect clip; {output_dir}")
+
+
 def assert_clip_seek_guards() -> None:
     with tempfile.TemporaryDirectory(prefix="liveclip-seek-guards-") as folder:
         root = Path(folder)
@@ -284,9 +379,11 @@ def assert_clip_seek_guards() -> None:
             with patch.object(renderer, "media_info", return_value=info), patch.object(renderer, "_run", side_effect=run), patch.object(renderer, "validate_media", side_effect=RuntimeError("bad decoded output") if name == "failed-validation" else None) as validate:
                 try:
                     renderer.clip(source, target, start, start + 2, subtitle)
-                except RuntimeError:
+                except RuntimeError as exc:
                     assert not success, name
                     assert target.read_bytes() == b"previous complete output", name
+                    if name == "still-damaged":
+                        assert "请先修复或重新获取源录播再重试" in str(exc)
                 else:
                     assert success, name
                     validate.assert_called_once_with(Path(calls[-1][0][-1]), 2, audio=True, decode=attempts == 2)
@@ -600,6 +697,8 @@ def assert_recording_media_with_ffmpeg(output_dir: Path) -> None:
     assert graceful.stat().st_size % 188 == 0, "graceful stop left a truncated TS packet"
     renderer.merge_recording_parts([graceful], output_dir / "graceful-stop.mp4")
     assert_clip_seek_with_ffmpeg(output_dir / "clip-seek")
+    assert_recording_reconnect_with_ffmpeg(output_dir / "http-reconnect")
+    assert_recording_reconnect_with_ffmpeg(output_dir / "http-reconnect-truncated", truncate_packet=True)
     print(f"media-check passed: real AVC/HEVC, resolution/frame-rate changes, reversed streams, audio/video timeline and preserved outputs; {output_dir}")
 
 
@@ -1580,6 +1679,108 @@ def assert_recording_deletion() -> None:
         finally:
             service.executor.shutdown(wait=True)
     print("Recording deletion checks passed: files, retries, busy/shared guards, clip/upload retention and reimport")
+
+
+def assert_batch_cleanup() -> None:
+    with tempfile.TemporaryDirectory(prefix="liveclip-batch-cleanup-") as folder:
+        root = Path(folder)
+        db = app.Database(root / "cleanup.db")
+        service = app.RecorderService(app.Settings(base_dir=str(root)), db, app.queue.Queue())
+        try:
+            records = []
+            for index in range(4):
+                path = root / f"record-{index}.mp4"
+                path.write_bytes(b"source")
+                rid = db.create_recording("123", f"batch-{index}", f"record-{index}", str(path), app.now_text(), source_type="local")
+                db.finish_recording(rid, "complete", str(path), app.now_text(), 3)
+                records.append((rid, path))
+            running, _ = db.create_task("analysis", "batch-running", {"recording_id": records[2][0]})
+            db.update_task(running, "running")
+            original_unlink = Path.unlink
+
+            def unlink(path, *args, **kwargs):
+                if path == records[0][1]:
+                    raise PermissionError("test file in use")
+                return original_unlink(path, *args, **kwargs)
+
+            with patch.object(Path, "unlink", unlink):
+                result = service.delete_media_batch("recordings", [r[0] for r in records] + [records[1][0]])
+            assert result["deleted"] == [records[1][0], records[3][0]]
+            assert {r["id"] for r in result["failed"]} == {records[0][0], records[2][0]}
+            assert "删除文件失败" in result["failed"][0]["error"] and "进行中的任务" in result["failed"][1]["error"]
+            assert [path.exists() for _, path in records] == [True, False, True, False]
+            assert service.delete_media_batch("recordings", []) == {"deleted": [], "failed": []}
+            for bad_ids in (None, "all", [records[0][0], 0], [records[0][0], True], [records[0][0], 1.5]):
+                try:
+                    service.delete_media_batch("recordings", bad_ids)
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError("invalid IDs must fail before any deletion")
+                assert records[0][1].exists()
+
+            clips = []
+            for index in range(3):
+                path = root / f"clip-{index}.mp4"
+                path.write_bytes(b"clip")
+                cid = db.create_clip(records[0][0], f"clip-{index}", 0, 3, str(path))
+                if index != 1:
+                    db.set_clip_status(cid, "complete")
+                clips.append((cid, path))
+            upload_id = db.create_upload(clips[0][0], "history", "", "", 21)
+            db.update_upload(upload_id, "success", bvid="BV-batch-history")
+            upload_before = db.get_upload(upload_id)
+            result = service.delete_media_batch("clips", [c[0] for c in clips])
+            assert result["deleted"] == [clips[0][0], clips[2][0]]
+            assert result["failed"][0]["id"] == clips[1][0] and "正在生成" in result["failed"][0]["error"]
+            assert records[0][1].exists() and clips[1][1].exists()
+            assert db.get_upload(upload_id) == upload_before
+
+            with db._connect() as conn:
+                conn.execute("ALTER TABLE tasks DROP COLUMN archived")
+            db = app.Database(db.path)
+            assert db.get_task(running)["archived"] == 0
+            states = {}
+            for state in ("complete", "success", "error", "cancelled", "queued", "retry", "running", "waiting"):
+                tid, _ = db.create_task("generic", "cleanup-" + state, {"checkpoint": state})
+                db.update_task(tid, state, result={"receipt": state}, error="preserved")
+                states[state] = tid
+            before = {tid: db.get_task(tid) for tid in states.values()}
+            selection = list(states.values())
+            raced, _ = db.create_task("generic", "raced")
+            db.update_task(raced, "complete")
+            selection.append(raced)
+            db.update_task(raced, "running")
+            later, _ = db.create_task("generic", "created-after-confirmation")
+            db.update_task(later, "complete")
+            assert db.clear_finished_tasks(selection + selection) == 4
+            assert db.clear_finished_tasks(selection) == 0
+            assert not db.list_tasks(statuses=("error", "cancelled"))
+            for state, tid in states.items():
+                archived = int(state in {"complete", "success", "error", "cancelled"})
+                assert db.get_task(tid) == dict(before[tid], archived=archived)
+            assert db.get_task(raced)["archived"] == db.get_task(later)["archived"] == 0
+            assert db.create_task("generic", "cleanup-complete") == (states["complete"], False), "cleanup must preserve deduplication"
+            assert db.create_task("generic", "cleanup-complete", force=True) == (states["complete"], True)
+            assert db.get_task(states["complete"])["archived"] == 0
+            assert db.claim_task(states["complete"])
+            db.update_task(states["error"], "waiting")
+            assert db.get_task(states["error"])["archived"] == 0
+            assert db.stats()["tasks"] == len(db.list_tasks(-1))
+            assert db.get_upload(upload_id) == upload_before and clips[1][1].exists()
+            for invalid in (None, [later, 0], [later, True], [later, "1"]):
+                try:
+                    db.clear_finished_tasks(invalid)
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError("invalid cleanup range accepted")
+                assert not db.get_task(later)["archived"]
+            assert db.clear_finished_tasks([]) == 0
+            assert app.Database(db.path).get_task(states["success"])["archived"] == 1
+        finally:
+            service.executor.shutdown(wait=True)
+    print("Batch cleanup checks passed: partial failures, validation, active guards, migration, deduplication and history retention")
 
 
 def assert_replay_discovery() -> None:
@@ -3973,6 +4174,7 @@ if __name__ == "__main__":
     assert_hikami_recording_flow()
     assert_recording_deletion()
     assert_clip_deletion()
+    assert_batch_cleanup()
     assert_replay_discovery()
     assert_replay_import_workflow()
     app.run_self_test()

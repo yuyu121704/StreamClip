@@ -26,6 +26,7 @@ Item {
     property string pendingAction: ""
     property var pendingValues: ({})
     signal navigate(int page)
+    signal cleanupRequested(string kind)
     function confirm(title, message, action, values) {
         confirmation.title=title; confirmationText.text=message
         pendingAction=action; pendingValues=values; confirmation.open()
@@ -36,6 +37,9 @@ Item {
     function timeText(milliseconds) { const s=Math.floor(milliseconds/1000); return Math.floor(s/60)+":"+String(s%60).padStart(2,"0") }
     function hasUnsaved() { return settingsForm.dirty || uploadForm.dirty || (roomDialog.opened && roomForm.dirty) || (importDialog.opened && importForm.dirty) || glossaryPanel.hasUnsaved() }
     function pauseVideo() { player.pause() }
+    function releaseCleanupClip(ids) {
+        if (ids.indexOf(bridge.workspace.clip.id) >= 0) pages.deletingClipId = bridge.workspace.clip.id
+    }
     onPageChanged: if (page !== 4) player.pause()
     onShowVideoChanged: if (!showVideo) player.pause()
 
@@ -63,7 +67,7 @@ Item {
             }
         }
         function onActionDone(action, data) {
-            if (action === "deleteClip") pages.deletingClipId=0
+            if (action === "deleteClip" || action === "cleanup") pages.deletingClipId=0
             if (action === "roomAdd") addRoomDialog.close()
             if (action === "roomSave") { pages.selectedRoom=data.room; roomForm.reset(data.room); roomDialog.close() }
             if (action === "mediaImport") { importDialog.close(); pages.navigate(1) }
@@ -192,6 +196,14 @@ Item {
                     symbol:"trash"; destructive:true
                     enabled:!!bridge.workspace.clip.canDelete&&!bridge.busy
                     onClicked:pages.confirm("删除切片","删除「"+bridge.workspace.clip.title+"」及其本地视频、封面、字幕和预览文件？此操作无法撤销。\n原录播和投稿历史会保留，已发布的平台稿件不会删除。","deleteClip",{id:bridge.workspace.clip.id})
+                }
+                ActionButton {
+                    objectName:"clearClipsButton"; text:"一键删除"
+                    symbol:"trash"; destructive:true
+                    enabled:clipModel.filters.count>0&&!bridge.busy
+                    ToolTip.visible:hovered
+                    ToolTip.text:"删除当前筛选范围内的切片及相关文件"
+                    onClicked:pages.cleanupRequested("clips")
                 }
                 Item { Layout.fillWidth:true }
                 ActionButton { text:"加入投稿队列"; symbol:"send"; primary:true; enabled:!!bridge.workspace.clip.id&&!bridge.busy; onClicked:bridge.perform("enqueueClip",{id:bridge.workspace.clip.id}) }

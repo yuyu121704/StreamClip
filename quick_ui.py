@@ -519,7 +519,7 @@ class Bridge(QObject):
         rooms = {str(r["room_id"]): r for r in self.db.list_rooms()}
         rows = [{"id": r["id"], "title": r["title"], "status": core.STATUS_LABELS.get(r["status"], r["status"]), "duration": core.format_seconds(r["duration"]), "source": {"live": "直播", "replay": "回放", "local": "本地"}.get(r.get("source_type"), "直播"), "room": r["room_id"], "started": r["started_at"], **media_origin(r, rooms)} for r in records]
         labels = {"analysis": "分析", "clip": "切片", "upload": "投稿", "replay_download": "回放下载", "media_import": "媒体导入"}
-        tasks = [{"id": t["id"], "kind": labels.get(t["kind"], t["kind"]), "state": t["status"], "status": core.STATUS_LABELS.get(t["status"], t["status"]), "progress": t["progress"], "message": t["message"], "error": t["error"], "updated": t["updated_at"], "attempts": t["attempts"]} for t in self.db.list_tasks()]
+        tasks = [{"id": t["id"], "kind": labels.get(t["kind"], t["kind"]), "state": t["status"], "status": core.STATUS_LABELS.get(t["status"], t["status"]), "progress": t["progress"], "message": t["message"], "error": t["error"], "updated": t["updated_at"], "attempts": t["attempts"]} for t in self.db.list_tasks(-1)]
         record = self.db.get_recording(selected) if any(r["id"] == selected for r in records) else None
         transcript = Path(str((record or {}).get("transcript_path") or ""))
         try:
@@ -551,6 +551,7 @@ class Bridge(QObject):
         workspace = self._workspace_snapshot(rooms)
         workspace["messages"] = messages
         workspace["recentTasks"] = sorted(tasks, key=lambda row: row["id"], reverse=True)[:8]
+        workspace["finishedTaskCount"] = sum(t["state"] in {"complete", "success", "error", "cancelled"} for t in tasks)
         workspace["recentClips"] = workspace["clips"][:8]
         return rows, sorted(tasks, key=lambda t: t["id"], reverse=True), selected, self._detail_cache, message, workspace
 
@@ -694,6 +695,19 @@ class Bridge(QObject):
                 return {"credentials": credentials, "models": [], "error": core._redact_secret(exc, client._api_key()), "request": request}
         self._submit("asr_models", fetch, network=True)
 
+    @Slot(str, result="QVariantMap")
+    def cleanupSelection(self, kind):
+        if kind == "tasks":
+            ids = [t["id"] for t in self.tasks.rows if t["state"] in {"complete", "success", "error", "cancelled"}]
+            return {"kind": kind, "ids": ids, "scope": "全部已结束任务"}
+        if kind not in {"recordings", "clips"}:
+            return {}
+        model = self.recordings if kind == "recordings" else self.clips
+        filters = model.filters
+        streamer = next(item["label"] for item in filters["streamers"] if item["key"] == filters["streamer"])
+        return {"kind": kind, "ids": [r["id"] for r in model.rows],
+                "scope": streamer + " · " + (filters["date"] or "全部日期")}
+
     @Slot(str, "QVariantMap")
     def perform(self, action, values):
         if self.busy:
@@ -753,6 +767,18 @@ class Bridge(QObject):
             elif action == "replayDownload":
                 task = self.service.download_replay(str(values.get("url") or values.get("bvid") or ""), str(values.get("title") or "回放"), source_liver_uid=str(values.get("source_liver_uid") or ""), source_liver_name=str(values.get("source_liver_name") or ""))
                 message = f"回放下载任务 #{task} 已加入"
+            elif action == "cleanup":
+                kind, ids = values.get("kind"), values.get("ids")
+                if kind == "tasks":
+                    count = self.db.clear_finished_tasks(ids)
+                    data = {"kind": kind, "message": f"已清理 {count} 条已结束任务。", "failed": []}
+                    if count < len(set(ids)):
+                        data["message"] += f"\n另有 {len(set(ids)) - count} 条已变化或已清理，未作修改。"
+                else:
+                    data = dict(self.service.delete_media_batch(kind, ids), kind=kind)
+                    label = "录播" if kind == "recordings" else "切片"
+                    data["message"] = f"已删除 {len(data['deleted'])} 条{label}，未删除 {len(data['failed'])} 条。"
+                message = data["message"]
             elif action == "deleteClip":
                 clip_id = int(values["id"])
                 self.service.delete_clip(clip_id)
@@ -1025,10 +1051,16 @@ class Bridge(QObject):
             self.refresh()
         elif kind == "perform":
             self._status = result["message"]
-            if result["action"] == "deleteClip" and self._selected_clip == result["data"]["id"]:
+            data = result["data"]
+            deleted_clips = [data["id"]] if result["action"] == "deleteClip" else data.get("deleted", []) if data.get("kind") == "clips" else []
+            if self._selected_clip in deleted_clips:
                 self._selected_clip = 0
                 self._workspace["clip"] = {}
                 self.workspaceChanged.emit()
+            if result["action"] == "cleanup" and data.get("kind") == "recordings" and self._selected in data["deleted"]:
+                self._selected = 0
+                self._detail = recording_detail(None)
+                self.detailChanged.emit()
             if result["action"] == "settingsSave":
                 self.settingsChanged.emit()
             self.actionDone.emit(result["action"], result["data"])

@@ -2107,6 +2107,7 @@ class Database:
                     "task_id": "INTEGER NOT NULL DEFAULT 0",
                     "metadata_json": "TEXT NOT NULL DEFAULT '{}'",
                 },
+                "tasks": {"archived": "INTEGER NOT NULL DEFAULT 0"},
             }
             for table, wanted in migrations.items():
                 columns = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -2609,7 +2610,7 @@ class Database:
                     return task_id, False
                 if force or status in {"error", "cancelled"}:
                     conn.execute(
-                        """UPDATE tasks SET status='queued',progress=0,message='',payload_json=?,result_json='{}',error='',cancel_requested=0,updated_at=?,started_at='',finished_at='' WHERE id=?""",
+                        """UPDATE tasks SET status='queued',archived=0,progress=0,message='',payload_json=?,result_json='{}',error='',cancel_requested=0,updated_at=?,started_at='',finished_at='' WHERE id=?""",
                         (encoded, timestamp, task_id),
                     )
                     return task_id, True
@@ -2637,13 +2638,13 @@ class Database:
             if statuses:
                 values = [str(item) for item in statuses]
                 placeholders = ",".join("?" for _ in values)
-                return self._rows(conn.execute(f"SELECT * FROM tasks WHERE status IN ({placeholders}) ORDER BY updated_at DESC,id DESC LIMIT ?", (*values, int(limit))))
-            return self._rows(conn.execute("SELECT * FROM tasks ORDER BY CASE WHEN status IN ('running','queued','waiting','retry') THEN 0 ELSE 1 END,updated_at DESC,id DESC LIMIT ?", (int(limit),)))
+                return self._rows(conn.execute(f"SELECT * FROM tasks WHERE archived=0 AND status IN ({placeholders}) ORDER BY updated_at DESC,id DESC LIMIT ?", (*values, int(limit))))
+            return self._rows(conn.execute("SELECT * FROM tasks WHERE archived=0 ORDER BY CASE WHEN status IN ('running','queued','waiting','retry') THEN 0 ELSE 1 END,updated_at DESC,id DESC LIMIT ?", (int(limit),)))
 
     def claim_task(self, task_id: int) -> bool:
         with self._connect() as conn:
             cursor = conn.execute(
-                """UPDATE tasks SET status='running',attempts=attempts+1,started_at=?,updated_at=?
+                """UPDATE tasks SET status='running',archived=0,attempts=attempts+1,started_at=?,updated_at=?
                    WHERE id=? AND status IN ('queued','retry') AND cancel_requested=0""",
                 (now_text(), now_text(), int(task_id)),
             )
@@ -2655,6 +2656,8 @@ class Database:
         if status is not None:
             assignments.append("status=?")
             params.append(str(status))
+            if status not in {"complete", "success", "error", "cancelled"}:
+                assignments.append("archived=0")
         if progress is not None:
             try:
                 value = max(0.0, min(100.0, float(progress)))
@@ -2691,6 +2694,18 @@ class Database:
             row = conn.execute("SELECT cancel_requested FROM tasks WHERE id=?", (int(task_id),)).fetchone()
             return bool(row and row[0])
 
+    def clear_finished_tasks(self, task_ids: list[int]) -> int:
+        """Hide confirmed terminal rows without losing idempotency or receipt checkpoints."""
+        if not isinstance(task_ids, list) or any(type(item) is not int or item <= 0 for item in task_ids):
+            raise ValueError("任务清理范围无效，请重新打开确认窗口。")
+        with self._connect() as conn:
+            cursor = conn.executemany(
+                """UPDATE tasks SET archived=1 WHERE id=? AND archived=0
+                   AND status IN ('complete','success','error','cancelled')""",
+                [(item,) for item in dict.fromkeys(task_ids)],
+            )
+            return cursor.rowcount
+
     def cleanup_tasks(self, keep_days: int = 30) -> int:
         """Remove old terminal task rows while retaining active history."""
         days = max(1, min(3650, int(keep_days)))
@@ -2704,7 +2719,7 @@ class Database:
 
     def requeue_running_tasks(self) -> list[dict[str, Any]]:
         with self._connect() as conn:
-            conn.execute("UPDATE tasks SET status='queued',message='程序重启后恢复',updated_at=? WHERE status='running' AND cancel_requested=0", (now_text(),))
+            conn.execute("UPDATE tasks SET status='queued',archived=0,message='程序重启后恢复',updated_at=? WHERE status='running' AND cancel_requested=0", (now_text(),))
             return self._rows(conn.execute("SELECT * FROM tasks WHERE status IN ('queued','retry') AND cancel_requested=0 ORDER BY id"))
 
     def stats(self) -> dict[str, int]:
@@ -2714,7 +2729,7 @@ class Database:
                 "recordings": int(conn.execute("SELECT COUNT(*) FROM recordings WHERE deleted=0").fetchone()[0]),
                 "clips": int(conn.execute("SELECT COUNT(*) FROM clips WHERE deleted=0").fetchone()[0]),
                 "uploads": int(conn.execute("SELECT COUNT(*) FROM uploads").fetchone()[0]),
-                "tasks": int(conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]),
+                "tasks": int(conn.execute("SELECT COUNT(*) FROM tasks WHERE archived=0").fetchone()[0]),
             }
 
     def export_configuration(self) -> dict[str, Any]:
@@ -5738,7 +5753,7 @@ class FFmpeg:
                     temporary.unlink(missing_ok=True)
                     continue
                 if code != 0 or stderr.strip() or not temporary.is_file() or temporary.stat().st_size == 0:
-                    context = "（从头解码重试仍未通过，原片保留）" if sequential else ""
+                    context = "（从头解码重试仍未通过，原片保留；请先修复或重新获取源录播再重试）" if sequential else ""
                     raise RuntimeError(f"生成切片失败{context}: {stderr[:500] or f'FFmpeg 退出码 {code}，未生成有效切片'}")
                 self.validate_media(temporary, duration, audio=audio, decode=sequential)
                 os.replace(temporary, destination)
@@ -8582,6 +8597,23 @@ class RecorderService:
         with self._active_lock:
             return set(self._active)
 
+    def delete_media_batch(self, kind: str, item_ids: list[int]) -> dict[str, Any]:
+        if kind not in {"recordings", "clips"}:
+            raise ValueError("无效的删除类型。")
+        if not isinstance(item_ids, list) or any(type(item) is not int or item <= 0 for item in item_ids):
+            raise ValueError("删除范围无效，请重新打开确认窗口。")
+        delete = self.delete_recording if kind == "recordings" else self.delete_clip
+        deleted, failed = [], []
+        # Reuse per-item guards/transactions. The existing reference scans are O(n^2) for a full
+        # library cleanup; introduce a file-reference index if large libraries outgrow this path.
+        for item_id in dict.fromkeys(item_ids):
+            try:
+                delete(item_id)
+                deleted.append(item_id)
+            except (ValueError, RuntimeError, OSError, sqlite3.Error) as exc:
+                failed.append({"id": item_id, "error": str(exc)})
+        return {"deleted": deleted, "failed": failed}
+
     def delete_clip(self, clip_id: int) -> None:
         """Delete local output; retain a hidden row for upload history."""
         clip_id = int(clip_id)
@@ -9206,24 +9238,19 @@ class RecorderService:
                         break
                     continue
                 part_path = self.settings.recordings_path / f"{basename}.part{len(parts) + 1:02d}.ts"
+                # Live HTTP reconnects can restart at a new FLV header mid-packet.
+                # Let this loop reopen the demuxer into a separate, validated part.
                 ffmpeg_args = [
                     self.settings.ffmpeg_path,
                     "-hide_banner",
                     "-loglevel",
                     "warning",
                     "-stdin",
+                    "-xerror",
                     "-user_agent",
                     USER_AGENT,
                     "-referer",
                     f"https://live.bilibili.com/{room_id}",
-                    "-reconnect",
-                    "1",
-                    "-reconnect_streamed",
-                    "1",
-                    "-reconnect_on_network_error",
-                    "1",
-                    "-reconnect_delay_max",
-                    "10",
                     "-rw_timeout",
                     "15000000",
                     "-i",
@@ -13696,6 +13723,13 @@ def run_self_test() -> None:
         db.update_task(task_id, status="complete", progress=100, result={"ok": True})
         same_task_id, created_again = db.create_task("analysis", "one", {"recording_id": recording_id})
         assert same_task_id == task_id and not created_again
+        assert db.clear_finished_tasks([task_id]) == 1
+        assert db.list_tasks() == [] and db.stats()["tasks"] == 0
+        assert json.loads(db.get_task(task_id)["result_json"]) == {"ok": True}
+        assert db.create_task("analysis", "one", {"recording_id": recording_id}) == (task_id, False)
+        assert db.create_task("analysis", "one", {"recording_id": recording_id}, force=True) == (task_id, True)
+        assert db.get_task(task_id)["archived"] == 0 and len(db.list_tasks()) == 1
+        assert db.clear_finished_tasks([task_id]) == 0
         recap = build_markdown_recap("测试录播", 120, "总结", [{"start": 5, "end": 20, "title": "高光", "reason": "反转", "score": 88}], [{"start": 6, "text": "一句话", "speaker_id": 1}], [], {"model": "fun-asr"})
         assert "# 测试录播" in recap and "## 精彩片段" in recap and "00:00:05" in recap
         package_record = {
