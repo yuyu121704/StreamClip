@@ -242,6 +242,47 @@ def assert_recording_stop_guards() -> None:
     print("Recording stop checks passed: graceful q, bounded fallback, no UI hard kill, private timeout diagnostics")
 
 
+def assert_recording_startup_retries() -> None:
+    """Transient live URLs get a startup grace window before the record is failed."""
+    with tempfile.TemporaryDirectory(prefix="liveclip-startup-retries-") as folder:
+        settings = app.Settings(base_dir=folder, danmaku_enabled=False, auto_slice=False,
+                                auto_recover_recording=False, record_retry_count=1, record_retry_delay=0)
+        settings.ensure_dirs()
+        db = app.Database(Path(folder) / "app.db")
+        db.add_room("1", "Startup retry test")
+        service = app.RecorderService(settings, db, app.queue.Queue())
+        room_calls = 0
+        launches = 0
+
+        def room_info(_room_id):
+            nonlocal room_calls
+            room_calls += 1
+            return {"live_status": room_calls <= 8, "title": "Startup retry test"}
+
+        def process_factory(args, **kwargs):
+            nonlocal launches
+            launches += 1
+
+            class FinishedProcess:
+                stdin = io.BytesIO()
+
+                def poll(self):
+                    return 1
+
+            return FinishedProcess()
+
+        with patch.object(service.ffmpeg, "ensure_tools"), \
+                patch.object(app.BilibiliClient, "room_info", side_effect=room_info), \
+                patch.object(app.BilibiliClient, "stream_urls", return_value=["https://example.invalid/live"]), \
+                patch.object(app.subprocess, "Popen", side_effect=process_factory):
+            service._record_worker("1", {"stop": app.threading.Event()})
+        record = db.list_recordings()[0]
+        assert launches == 7, launches
+        assert record["status"] == "error" and record["duration"] == 0
+        service.executor.shutdown(wait=True)
+    print("Recording startup retry checks passed: empty live streams receive six extra startup retries")
+
+
 def assert_recording_reconnect_with_ffmpeg(output_dir: Path, *, truncate_packet: bool = False) -> None:
     """A restarted live HTTP stream must get a new demuxer and recording part."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -518,7 +559,16 @@ def assert_recording_media_with_ffmpeg(output_dir: Path) -> None:
         run(args + [str(path)])
     for second, name in ((reversed_avc, "reordered.mp4"), (reversed_hevc, "mixed-codecs.mp4")):
         output = output_dir / name
-        renderer.merge_recording_parts([first, second], output)
+        if name == "mixed-codecs.mp4":
+            with patch.object(renderer, "_run", wraps=renderer._run) as media_run:
+                renderer.merge_recording_parts([first, second], output)
+            normalized = [call.args[0] for call in media_run.call_args_list if "-vf" in call.args[0]]
+            assert any(
+                "-c:a" in args and args[args.index("-c:a") + 1] == "copy"
+                for args in normalized
+            ), normalized
+        else:
+            renderer.merge_recording_parts([first, second], output)
         assert abs(renderer.duration(output) - 4) < 0.15
         for timestamp, dominant, expected_frequency in ((0.5, 0, 440), (3, 2, 880)):
             pixel = run(["-ss", str(timestamp), "-i", str(output), "-frames:v", "1", "-vf", "scale=1:1", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"])
@@ -4166,6 +4216,7 @@ if __name__ == "__main__":
     assert_media_resource_limits()
     assert_media_failure_guards()
     assert_recording_stop_guards()
+    assert_recording_startup_retries()
     assert_clip_seek_guards()
     assert_hikami_glossary_workflow()
     assert_hikami_search_transport()

@@ -20,13 +20,14 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 
-VERSION = "2026.09.24.2"
+VERSION = "2026.09.25.1"
 REPOSITORY = "yuyu121704/StreamClip"
 RELEASES_URL = f"https://github.com/{REPOSITORY}/releases"
 API_URL = f"https://api.github.com/repos/{REPOSITORY}/releases?per_page=100"
 MAX_PACKAGE_SIZE = 1024 * 1024 * 1024
 LOCAL_HISTORY = [
-    {"version": VERSION, "date": "2026-09-24", "summary": "录播、切片支持按当前筛选一键删除；任务支持一键清理已结束记录。确认后逐项检查，保留正在处理或删除失败的项目，以及投稿历史和任务去重数据。"},
+    {"version": VERSION, "date": "2026-09-25", "summary": "修复直播刚开播时流地址短暂失效导致的录制失败；混合视频编码分段在音频参数一致时复制 AAC 时间线，避免长录播音轨被重新编码后截断，并继续执行严格校验。"},
+    {"version": "2026.09.24.2", "date": "2026-09-24", "summary": "录播、切片支持按当前筛选一键删除；任务支持一键清理已结束记录。确认后逐项检查，保留正在处理或删除失败的项目，以及投稿历史和任务去重数据。"},
     {"version": "2026.09.24.1", "date": "2026-09-24", "summary": "修复直播断流后的双重重连：重新获取地址并另存分段，避免新 FLV 流续接到旧流导致包错位和坏帧；保留严格音视频校验，旧损坏录播提示先修复再重试。"},
     {"version": "2026.09.22.2", "date": "2026-09-22", "summary": "竖屏切片改为16:9横向排版：左侧完整人物画面，右侧黑底居中白字绿边字幕；保留字幕时间轴，横屏沿用原样式。"},
     {"version": "2026.09.22.1", "date": "2026-09-22", "summary": "修复竖屏切片字幕过大：按显示宽度缩放字号和描边，保留上下边距比例，识别旋转视频；横屏字幕样式保持不变。"},

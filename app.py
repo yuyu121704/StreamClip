@@ -5223,6 +5223,7 @@ class FFmpeg:
         signature_keys = ("codec_name", "profile", "width", "height", "pix_fmt", "sample_aspect_ratio", "time_base", "sample_rate", "channels", "channel_layout", "extradata_hash")
         signatures = [tuple(tuple(stream.get(key) for key in signature_keys) for stream in streams) for streams in selected]
         normalize = any(signature != signatures[0] for signature in signatures[1:])
+        audio_copy = len(selected[0]) == 2 and all(signature[1] == signatures[0][1] for signature in signatures[1:])
         video = selected[0][0]
         width, height = int(video.get("width") or 0), int(video.get("height") or 0)
         if width <= 0 or height <= 0:
@@ -5257,12 +5258,35 @@ class FFmpeg:
                         self.settings.ffmpeg_path, "-hide_banner", "-v", "error", "-nostdin", "-xerror", "-abort_on", "empty_output_stream", "-y",
                         "-i", str(output), "-map", "0:v:0", "-map", "0:a:0?",
                         "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={rate},format=yuv420p",
-                        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-c:a", "aac", "-ar", "48000", "-ac", "2",
+                        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                        *(
+                            ["-c:a", "copy"]
+                            if audio_copy
+                            else ["-c:a", "aac", "-ar", "48000", "-ac", "2"]
+                        ),
                         "-video_track_timescale", "90000", str(normalized),
                     ], max(1800, math.ceil(info["duration"] * 3)))
                     if code != 0 or stderr.strip():
                         raise RuntimeError(f"录播分段转码失败：{part.name}：{stderr[:500]}")
-                    self.validate_media(normalized, info["duration"], audio=audio)
+                    try:
+                        self.validate_media(normalized, info["duration"], audio=audio)
+                    except RuntimeError as exc:
+                        if not audio_copy or "媒体时长不完整" not in str(exc):
+                            raise
+                        # Copying preserves long live AAC timelines. If a source
+                        # has unusual timestamps, retry once with a fresh AAC track.
+                        normalized.unlink(missing_ok=True)
+                        code, _, stderr = self._run([
+                            self.settings.ffmpeg_path, "-hide_banner", "-v", "error", "-nostdin", "-xerror", "-abort_on", "empty_output_stream", "-y",
+                            "-i", str(output), "-map", "0:v:0", "-map", "0:a:0?",
+                            "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={rate},format=yuv420p",
+                            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                            "-c:a", "aac", "-ar", "48000", "-ac", "2",
+                            "-video_track_timescale", "90000", str(normalized),
+                        ], max(1800, math.ceil(info["duration"] * 3)))
+                        if code != 0 or stderr.strip():
+                            raise RuntimeError(f"录播分段转码失败：{part.name}：{stderr[:500]}")
+                        self.validate_media(normalized, info["duration"], audio=audio)
                     os.replace(normalized, output)
                 manifest.append(f"file {output.name}\n")
             playlist = stage / "parts.ffconcat"
@@ -9223,6 +9247,8 @@ class RecorderService:
                     self.emit("warning", f"弹幕采集启动失败，继续录播：{exc}", recording_id=recording_id)
 
             retries_used = 0
+            consecutive_failures = 0
+            startup_retry_limit = max(int(self.settings.record_retry_count), 6)
             last_return_code: int | None = None
             while not state["stop"].is_set() and not self.stop_event.is_set():
                 try:
@@ -9230,8 +9256,10 @@ class RecorderService:
                     stream_url = stream_urls[retries_used % len(stream_urls)]
                 except Exception as exc:
                     last_return_code = None
-                    self.emit("warning", f"获取流地址失败（重试 {retries_used}/{self.settings.record_retry_count}）：{exc}", recording_id=recording_id)
-                    if retries_used >= self.settings.record_retry_count:
+                    consecutive_failures += 1
+                    retry_limit = startup_retry_limit if not parts else int(self.settings.record_retry_count)
+                    self.emit("warning", f"获取流地址失败（连续重试 {consecutive_failures}/{retry_limit}）：{exc}", recording_id=recording_id)
+                    if consecutive_failures > retry_limit:
                         break
                     retries_used += 1
                     if state["stop"].wait(self.settings.record_retry_delay) or self.stop_event.is_set():
@@ -9301,8 +9329,12 @@ class RecorderService:
                     part_size = 0
                 if part_size > 0:
                     parts.append(part_path)
+                    consecutive_failures = 0
+                    if int(self.settings.record_retry_count) <= 0:
+                        break
                 else:
                     part_path.unlink(missing_ok=True)
+                    consecutive_failures += 1
                 if state["stop"].is_set() or self.stop_event.is_set():
                     break
                 live = True
@@ -9312,11 +9344,12 @@ class RecorderService:
                     self.emit("warning", f"录制健康检查失败，暂按直播中处理：{exc}", recording_id=recording_id)
                 if not live:
                     break
-                if retries_used >= self.settings.record_retry_count:
-                    self.emit("warning", "录播重连次数已耗尽，保留已录制分段", recording_id=recording_id)
+                retry_limit = startup_retry_limit if not parts else int(self.settings.record_retry_count)
+                if consecutive_failures > retry_limit:
+                    self.emit("warning", "直播流连续不可用，保留已录制分段", recording_id=recording_id)
                     break
                 retries_used += 1
-                self.emit("info", f"直播流中断，{self.settings.record_retry_delay} 秒后重新获取地址（第 {retries_used}/{self.settings.record_retry_count} 次）", recording_id=recording_id)
+                self.emit("info", f"直播流中断，{self.settings.record_retry_delay} 秒后重新获取地址（连续重试 {consecutive_failures}/{retry_limit}）", recording_id=recording_id)
                 if state["stop"].wait(self.settings.record_retry_delay) or self.stop_event.is_set():
                     break
 
