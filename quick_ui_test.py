@@ -2019,6 +2019,9 @@ def run(motion_preference, updates_only=False):
                     # 抓取系统已呈现的窗口，不通过强制重绘掩盖呈现问题。
                     picture = window.screen().grabWindow(int(window.winId())).toImage()
                     assert not picture.isNull()
+                    rgba = picture.convertToFormat(QImage.Format_RGBA8888)
+                    pixels = bytes(rgba.constBits())
+                    assert len({pixels[i:i + 3] for i in range(0, len(pixels), 4 * 113)}) > 32, "页面只显示背景，未实际绘制内容"
                     assert picture.save(str(output / f"page-{page}-{width}.png"))
             window.setProperty("page", 0)
             records = window.findChild(QObject, "recordingList")
@@ -2043,18 +2046,30 @@ def run(motion_preference, updates_only=False):
             timer = QTimer()
             # 使用精确的测试驱动，避免将粗略定时器的调度延迟误计为缩放性能下降。
             timer.setTimerType(Qt.PreciseTimer)
+            resize_step = 0
             def resize():
+                nonlocal resize_step
                 ticks.append(time.perf_counter())
-                step = len(ticks) % 80
+                resize_step += 1
+                step = resize_step % 80
                 window.resize(1020 + abs(40 - step) * 6, 680 + abs(40 - step) * 3)
+                if resize_step == 160:
+                    loop.quit()
             timer.timeout.connect(resize)
             timer.start(16)
             bridge.timer.start(180)
             with patch.object(db, "list_recordings", side_effect=slow_records):
                 loop = QEventLoop()
-                # Warm the renderer at the same resize/database load, not an idle page.
-                QTimer.singleShot(1500, loop.quit)
+                # Cover the complete geometry range twice; sampling must not reset the workload.
+                warmup_started = time.perf_counter()
+                warmup_deadline = QTimer()
+                warmup_deadline.setSingleShot(True)
+                warmup_deadline.timeout.connect(loop.quit)
+                warmup_deadline.start(7000)
                 loop.exec()
+                warmup_deadline.stop()
+                warmup_ms = (time.perf_counter() - warmup_started) * 1000
+                assert resize_step >= 160, "完整缩放范围预热未完成"
                 frames.clear()
                 ticks.clear()
                 QTimer.singleShot(5000, loop.quit)
@@ -2067,7 +2082,10 @@ def run(motion_preference, updates_only=False):
             ordered = sorted(intervals)
             resize_intervals = sorted((b - a) * 1000 for a, b in zip(ticks, ticks[1:]))
             report = {"graphics_api": str(window.rendererInterface().graphicsApi()), "frames": len(frames), "resize_updates": len(ticks), "resize_hz": (len(ticks) - 1) / (ticks[-1] - ticks[0]), "resize_p95_ms": resize_intervals[int(len(resize_intervals) * .95)], "frame_callback_hz": (len(frames) - 1) / (frames[-1] - frames[0]), "median_ms": statistics.median(intervals), "p95_ms": ordered[int(len(ordered) * .95)], "max_ms": max(intervals), "over_33ms": sum(v > 33.34 for v in intervals), "method": "5 秒程序连续缩放，300 条录播，后台数据库读取延迟 150ms；帧回调经队列在 GUI 线程计时，不是显示器实际呈现帧率；不等同于手工拖边框验收", "qml_warnings": warnings}
-            report["warmup_ms"] = 1500
+            report["warmup_ms"] = warmup_ms
+            report["warmup_cycles"] = 2
+            report["render_loop"] = ui.os.environ.get("QSG_RENDER_LOOP", "default")
+            report["window_swap_interval"] = window.format().swapInterval()
             # 静止和忙碌状态不能因禁用 Present 等待而无限重绘。
             QTest.qWait(200)
             frames.clear()
@@ -2080,7 +2098,7 @@ def run(motion_preference, updates_only=False):
             bridge._busy = False
             bridge.changed.emit()
             (output / "performance.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-            assert not [w for w in warnings if any(s in w for s in ("ReferenceError", "TypeError", "Unable to assign", "Binding loop", "recursive rearrange", "failed to load", "Failed to create", "Failed to resize"))], warnings
+            assert not [w for w in warnings if any(s in w for s in ("ReferenceError", "TypeError", "Unable to assign", "Binding loop", "recursive rearrange", "failed to load", "Failed to create", "Failed to resize", "Failed to build or resize swapchain", "Failed to present", "Failed to end frame"))], warnings
             assert report["resize_hz"] >= 45, "消除黑边不能明显牺牲缩放响应：" + str(report)
             print(json.dumps(report, ensure_ascii=False, indent=2))
             done = []
