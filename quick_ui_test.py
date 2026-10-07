@@ -4,6 +4,7 @@ import json
 import statistics
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -1052,6 +1053,15 @@ def check_batch_cleanup(application, bridge, engine, window, folder, output):
             [(f"bulk-ui-{i}", timestamp, timestamp) for i in range(505)])
     bridge.refresh()
     wait_for(application, lambda: not bridge._refreshing)
+    assert all(row["displayId"] == ui.core.format_task_id(row["id"]) for row in bridge.tasks.rows), "任务列表未使用格式化编号"
+    window.setProperty("page", 1)
+    task_list = window.findChild(QObject, "taskList")
+    task_list.setProperty("currentIndex", 0)
+    wait_for(application, lambda: qml_call(task_list, "currentItem")[0] is not None)
+    first_task = bridge.tasks.rows[0]
+    assert qml_call(task_list, "currentItem.contentItem.children[0].text")[0].startswith("#" + first_task["displayId"] + "  "), "任务标题未显示格式化编号"
+    qml_call(task_list, "currentItem.clicked()")
+    assert window.property("selectedTask") == first_task["id"], "任务选择必须保留原始整数 ID"
     bridge.recordings.setFilter("room:700001", "2026-01-02")
     bridge.clips.setFilter("room:700002", "2026-01-02")
     assert len(bridge.cleanupSelection("tasks")["ids"]) >= 505, "cleanup must not stop at 500 rows"
@@ -1185,6 +1195,37 @@ def wait_for(application, predicate, timeout=5):
         assert time.monotonic() < deadline, "Qt 操作超时"
         application.processEvents()
         time.sleep(0.005)
+
+
+def check_close_does_not_wait_for_media(application, output):
+    with tempfile.TemporaryDirectory(dir=output) as folder:
+        settings = ui.core.Settings(base_dir=folder)
+        settings.ensure_dirs()
+        service = ui.core.RecorderService(settings, ui.core.Database(settings.data_path / "app.db"), ui.queue.Queue())
+        bridge = ui.Bridge(settings, service.db, service)
+        entered, release = threading.Event(), threading.Event()
+        closed = []
+
+        def unfinished_media():
+            entered.set()
+            assert release.wait(5), "media task was not released"
+
+        service.executor.submit(unfinished_media)
+        bridge.closed.connect(lambda: closed.append(True))
+        try:
+            assert entered.wait(5)
+            bridge.close()
+            wait_for(application, service.stop_event.is_set)
+            wait_for(application, lambda: bool(closed), timeout=3)
+            assert bridge.busy and "保存录播分段" in bridge.status
+            assert not release.is_set(), "close waited for an unrelated background worker"
+        finally:
+            release.set()
+            service.stop()
+            bridge.timer.stop()
+            bridge._pool.shutdown(wait=True)
+            bridge._network.shutdown(wait=True, cancel_futures=True)
+    print("Qt exit check passed: close completes without waiting for unrelated background work")
 
 
 def check_apple_ui(application, bridge, window, output):
@@ -1877,6 +1918,14 @@ def run(motion_preference, updates_only=False):
             with patch.object(service, "analyze_recording", return_value=91) as analyze:
                 bridge.command("analyze", str(rid))
                 wait_for(application, lambda: not bridge.busy)
+                analyze.assert_called_once_with(rid, force=True, reuse_transcript=False, run_pipeline=True)
+            saved = json.loads(transcript.read_text(encoding="utf-8"))
+            saved["asr_metadata"]["audio_timeline_signature"] = ui.core.asr_timeline_signature(media)
+            saved["segments"] = [{"start": 12, "end": 75, "text": "离线转写"}]
+            ui.core.write_json_atomic(transcript, saved)
+            with patch.object(service, "analyze_recording", return_value=91) as analyze:
+                bridge.command("analyze", str(rid))
+                wait_for(application, lambda: not bridge.busy)
                 analyze.assert_called_once_with(rid, force=True, reuse_transcript=True, run_pipeline=True)
             with patch.object(service, "download_replay", return_value=92) as download:
                 bridge.perform("replayDownload", {"bvid": "BV1xx411c7mD", "title": "直播回放"})
@@ -2039,6 +2088,7 @@ def run(motion_preference, updates_only=False):
             bridge.close()
             wait_for(application, lambda: bool(done))
             assert not bridge.timer.isActive() and service.stop_event.is_set()
+            check_close_does_not_wait_for_media(application, output)
         finally:
             (output / "qml-warnings.json").write_text(json.dumps(warnings, ensure_ascii=False, indent=2), encoding="utf-8")
             bridge.timer.stop()

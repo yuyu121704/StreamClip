@@ -8,6 +8,7 @@ import http.client
 import http.server
 import io
 import json
+import os
 import re
 import subprocess
 import sys
@@ -18,6 +19,28 @@ import urllib.error
 from unittest.mock import Mock, patch
 
 import app
+
+
+def assert_task_id_formatting() -> None:
+    cases = {
+        1: "1",
+        100: "100",
+        101: "a1",
+        200: "a100",
+        201: "b1",
+        2600: "y100",
+        2601: "z1",
+        2700: "z100",
+        2701: "aa1",
+        5300: "az100",
+        5301: "ba1",
+        70300: "zz100",
+        70301: "aaa1",
+    }
+    for task_id, expected in cases.items():
+        assert app.format_task_id(task_id) == expected, (task_id, expected, app.format_task_id(task_id))
+    assert app.format_task_id("259") == "b59"
+    print("Task ID formatting checks passed: 1..100, letter blocks, rollover and multi-letter prefixes")
 
 
 def assert_media_resource_limits() -> None:
@@ -124,6 +147,225 @@ def assert_media_resource_limits() -> None:
     print("Media resource checks passed: bounded input/output/filter threads, shared queue, free probes, all jobs complete, exception release")
 
 
+def assert_asr_timeline_guards() -> None:
+    with tempfile.TemporaryDirectory(prefix="liveclip-asr-timeline-") as folder:
+        root = Path(folder)
+        source, audio = root / "source.mp4", root / "source.asr.wav"
+        source.write_bytes(b"synthetic media")
+        renderer = app.FFmpeg(app.Settings(base_dir=folder))
+        marker = audio.with_suffix(".wav.timeline.json")
+
+        def write_audio(path):
+            with app.wave.open(str(path), "wb") as wav:
+                wav.setnchannels(1)
+                wav.setsampwidth(2)
+                wav.setframerate(16000)
+                wav.writeframes(b"\x00\x00" * 1600)
+
+        def extract(args, _timeout):
+            assert args[args.index("-af") + 1] == "aresample=async=1:first_pts=0"
+            write_audio(Path(args[-1]))
+            return 0, "", ""
+
+        # A newer mtime alone must not make pre-fix audio reusable.
+        write_audio(audio)
+        with patch.object(renderer, "_run", side_effect=extract) as run:
+            assert renderer.extract_audio(source, audio) == audio and run.call_count == 1
+            assert marker.is_file()
+            renderer.extract_audio(source, audio)
+            assert run.call_count == 1, "verified audio cache was not reused"
+            for invalidate in (
+                lambda: marker.write_text("invalid JSON", encoding="utf-8"),
+                lambda: audio.write_bytes(audio.read_bytes() + b"changed"),
+                lambda: source.write_bytes(source.read_bytes() + b"changed"),
+                lambda: marker.unlink(),
+            ):
+                invalidate()
+                previous = run.call_count
+                renderer.extract_audio(source, audio)
+                assert run.call_count == previous + 1, "unverified/changed cache was reused"
+        original = audio.read_bytes()
+        marker.write_text("{}", encoding="utf-8")
+        for mode in ("nonzero", "decode-error", "missing", "invalid-wav", "empty-wav", "exception", "source-changed"):
+            def fail(args, _timeout):
+                target = Path(args[-1])
+                if mode == "exception":
+                    raise RuntimeError("synthetic launch failure")
+                if mode != "missing":
+                    write_audio(target)
+                if mode == "invalid-wav":
+                    target.write_bytes(b"invalid" * 20)
+                if mode == "empty-wav":
+                    with app.wave.open(str(target), "wb") as wav:
+                        wav.setnchannels(1)
+                        wav.setsampwidth(2)
+                        wav.setframerate(16000)
+                if mode == "source-changed":
+                    source.write_bytes(source.read_bytes() + b"still recording")
+                return (1 if mode == "nonzero" else 0), "", ("decode error" if mode == "decode-error" else "")
+
+            with patch.object(renderer, "_run", side_effect=fail):
+                try:
+                    renderer.extract_audio(source, audio)
+                except RuntimeError:
+                    pass
+                else:
+                    raise AssertionError(f"unsafe ASR output accepted: {mode}")
+            assert audio.read_bytes() == original and marker.read_text(encoding="utf-8") == "{}"
+            assert not audio.with_suffix(".wav.partial").exists()
+    print("ASR cache checks passed: timeline filter, verified reuse, legacy/changed/corrupt invalidation and failure preservation")
+
+
+def assert_transcript_timeline_guards() -> None:
+    with tempfile.TemporaryDirectory(prefix="liveclip-transcript-timeline-") as folder:
+        root = Path(folder)
+        source = root / "source.mp4"
+        source.write_bytes(b"synthetic media")
+        settings = app.Settings(base_dir=folder, dashscope_api_key="offline-test", auto_slice=False,
+                                vad_enabled=True, vad_filter_asr=True)
+        settings.ensure_dirs()
+        db = app.Database(root / "app.db")
+        rid = db.create_recording("1", "timeline", "timeline test", str(source), app.now_text())
+        db.finish_recording(rid, "complete", str(source), app.now_text(), 10)
+        service = app.RecorderService(settings, db, app.queue.Queue())
+        transcript = source.with_suffix(".transcript.json")
+        legacy = {"segments": [{"start": 0.2, "end": 0.8, "text": "旧字幕"}]}
+        app.write_json_atomic(transcript, legacy)
+        original = transcript.read_bytes()
+        try:
+            assert not app.can_reuse_transcript(db.get_recording(rid))
+            for auto in (False, True):
+                with patch.object(service.ffmpeg, "clip") as render:
+                    try:
+                        service._create_clip_sync(rid, 0, 2, "timeline", auto)
+                    except RuntimeError as exc:
+                        assert "重新识别语音" in str(exc)
+                    else:
+                        raise AssertionError("unverified transcript reached rendering")
+                    render.assert_not_called()
+            tid, _ = db.create_task("analysis", f"recording:{rid}", {"recording_id": rid, "reuse_transcript": True})
+            with patch.object(service.transcriber, "transcribe") as transcribe, patch.object(app, "analyze_transcript") as analyze:
+                service._analyze_recording(rid, tid)
+                transcribe.assert_not_called()
+                analyze.assert_not_called()
+            assert db.get_task(tid)["status"] == "error" and transcript.read_bytes() == original and not db.list_clips()
+            mapping = [{"original_start": 5.0, "original_end": 6.0, "trimmed_start": 0.0, "trimmed_end": 1.0}]
+            tid, _ = db.create_task("analysis", f"recording:{rid}", {"recording_id": rid}, force=True)
+            with patch.object(service.ffmpeg, "extract_audio", side_effect=lambda _source, target: target.write_bytes(b"normalized audio")), \
+                    patch.object(service.ffmpeg, "detect_silence", return_value={"speech_intervals": [{"start": 5, "end": 6}]}) as vad, \
+                    patch.object(service.ffmpeg, "extract_intervals_audio", return_value=mapping) as trim, \
+                    patch.object(service.transcriber, "transcribe", return_value=legacy["segments"]) as transcribe, \
+                    patch.object(app, "analyze_transcript", return_value=("offline recap", [])), \
+                    patch.object(service, "_start_glossary_job"):
+                service._analyze_recording(rid, tid)
+            canonical = source.with_suffix(".asr.wav")
+            assert vad.call_args.args[0] == trim.call_args.args[0] == canonical
+            assert transcribe.call_args.args[0] == source.with_suffix(".vad.asr.wav") and transcribe.call_args.args[2] == 1.0
+            assert db.get_task(tid)["status"] == "complete"
+            verified = app.load_verified_transcript(source, transcript)
+            assert verified["segments"][0]["start"] == 5.2 and verified["segments"][0]["end"] == 5.8
+            assert app.can_reuse_transcript(db.get_recording(rid))
+            no_asr_source = root / "no-asr.mp4"
+            no_asr_source.write_bytes(b"synthetic media")
+            no_asr_rid = db.create_recording("1", "timeline-no-asr", "ASR disabled", str(no_asr_source), app.now_text())
+            db.finish_recording(no_asr_rid, "complete", str(no_asr_source), app.now_text(), 10)
+            settings.transcription_provider = "none"
+            with patch.object(service.ffmpeg, "extract_audio") as extract, \
+                    patch.object(service.transcriber, "transcribe") as transcribe, \
+                    patch.object(app, "analyze_transcript", return_value=("no speech", [])), \
+                    patch.object(service, "_start_glossary_job"):
+                service._analyze_recording(no_asr_rid)
+                extract.assert_not_called()
+                transcribe.assert_not_called()
+            assert app.load_verified_transcript(no_asr_source, no_asr_source.with_suffix(".transcript.json"))["segments"] == []
+            assert not app.can_reuse_transcript(db.get_recording(no_asr_rid))
+            settings.transcription_provider = "dashscope"
+            previous_transcript = transcript.read_bytes()
+
+            def changed_during_asr(*_args):
+                source.write_bytes(source.read_bytes() + b"changed during recognition")
+                return legacy["segments"]
+
+            tid, _ = db.create_task("analysis", f"recording:{rid}", {"recording_id": rid}, force=True)
+            with patch.object(service.ffmpeg, "extract_audio"), \
+                    patch.object(service.ffmpeg, "detect_silence", return_value={"speech_intervals": []}), \
+                    patch.object(service.transcriber, "transcribe", side_effect=changed_during_asr), \
+                    patch.object(app, "analyze_transcript") as analyze:
+                service._analyze_recording(rid, tid)
+                analyze.assert_not_called()
+            assert db.get_task(tid)["status"] == "error" and transcript.read_bytes() == previous_transcript
+            assert not app.can_reuse_transcript(db.get_recording(rid))
+            try:
+                app.load_verified_transcript(source, transcript)
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("source changes did not invalidate transcript")
+        finally:
+            service.stop()
+            service.executor.shutdown(wait=True)
+    print("Transcript checks passed: legacy reuse/render blocked without charging, normalized VAD/remap, ASR-disabled compatibility and source-change preservation")
+
+
+def assert_asr_media_timeline_with_ffmpeg(output_dir: Path) -> None:
+    """Distinct tones independently anchor audio before and after a timestamp gap."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    renderer = app.FFmpeg(app.Settings(base_dir=str(output_dir), vad_min_silence=0.2, vad_padding=0))
+    renderer.ensure_tools()
+    source = output_dir / "delayed-and-gapped.mp4"
+
+    def run(args):
+        code, _, error = renderer._run([renderer.settings.ffmpeg_path, "-hide_banner", "-v", "error", "-nostdin", "-y", *args], 60)
+        assert code == 0 and not error.strip(), error
+
+    run(["-f", "lavfi", "-i", "color=c=black:s=160x90:r=25:d=5",
+         "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=16000:duration=2",
+         "-f", "lavfi", "-i", "sine=frequency=880:sample_rate=16000:duration=2",
+         "-filter_complex", "[1:a][2:a]concat=n=2:v=0:a=1,aselect='not(between(t,1,2))',asetpts=PTS+0.5/TB[a]",
+         "-map", "0:v:0", "-map", "[a]", "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", str(source)])
+    legacy = output_dir / "old-flattened.wav"
+    run(["-i", str(source), "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(legacy)])
+    audio = renderer.extract_audio(source, output_dir / "normalized.wav")
+
+    def duration(path):
+        with app.wave.open(str(path), "rb") as wav:
+            return wav.getnframes() / wav.getframerate()
+
+    def samples(path, start):
+        with app.wave.open(str(path), "rb") as wav:
+            wav.setpos(round(start * wav.getframerate()))
+            data = wav.readframes(3200)
+        return app.struct.unpack("<" + "h" * (len(data) // 2), data)
+
+    def tone(path, start, frequency):
+        values = samples(path, start)
+        crossings = sum(a <= 0 < b for a, b in zip(values, values[1:])) / (len(values) / 16000)
+        assert abs(crossings - frequency) < 15, (path, start, crossings, frequency)
+
+    assert 2.9 < duration(legacy) < 3.2 and abs(duration(audio) - 4.5) < 0.1
+    for start in (0.1, 1.9):
+        assert max(abs(value) for value in samples(audio, start)) < 5, ("gap was removed", start)
+    tone(audio, 0.8, 440)
+    tone(audio, 3.0, 880)
+    tone(legacy, 1.9, 880)
+    uploaded = renderer.compress_asr_audio(audio, output_dir / "upload.mp3")
+    decoded = output_dir / "upload-decoded.wav"
+    run(["-i", str(uploaded), "-c:a", "pcm_s16le", str(decoded)])
+    assert abs(duration(decoded) - duration(audio)) < 0.01
+    tone(decoded, 3.0, 880)
+    assert max(abs(value) for value in samples(decoded, 1.9)) < 5
+    vad = renderer.detect_silence(audio)
+    assert any(item["start"] < 1.6 and item["end"] > 2.4 for item in vad["silences"]), vad
+    trimmed = output_dir / "vad.wav"
+    mapping = renderer.extract_intervals_audio(audio, trimmed, [{"start": 0.7, "end": 1.3}, {"start": 2.8, "end": 4.0}])
+    assert abs(duration(trimmed) - 1.8) < 0.01
+    tone(trimmed, 0.1, 440)
+    tone(trimmed, 0.8, 880)
+    mapped = app.remap_trimmed_segments([{"start": 0.8, "end": 1.0, "text": "anchor"}], mapping, 5)
+    assert abs(mapped[0]["start"] - 3.0) < 0.001 and abs(mapped[0]["end"] - 3.2) < 0.001
+    print(f"ASR media timeline passed: delayed start, middle gap, independent tones, upload and VAD/remap; {output_dir}")
+
+
 def assert_media_failure_guards() -> None:
     """An empty decoder result or a failed merge must never become a completed recording."""
     with tempfile.TemporaryDirectory(prefix="liveclip-media-guards-") as folder:
@@ -198,6 +440,37 @@ def assert_media_failure_guards() -> None:
 
 
 def assert_recording_stop_guards() -> None:
+    with tempfile.TemporaryDirectory(prefix="liveclip-exit-wait-") as folder:
+        settings = app.Settings(base_dir=folder)
+        settings.ensure_dirs()
+        service = app.RecorderService(settings, app.Database(Path(folder) / "app.db"), app.queue.Queue())
+        launched, stopped = threading.Event(), threading.Event()
+        child = None
+
+        def media_worker():
+            nonlocal child
+            child = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            launched.set()
+            child.wait()
+
+        try:
+            service.executor.submit(media_worker)
+            assert launched.wait(5), "media subprocess did not start"
+            stopping = threading.Thread(target=lambda: (service.stop(), stopped.set()), daemon=True)
+            stopping.start()
+            assert service.stop_event.wait(5), "service did not start stopping"
+            assert not stopped.wait(0.2), "window could close before its media child exited"
+        finally:
+            if child and child.poll() is None:
+                child.terminate()
+                child.wait(timeout=5)
+            service.stop()
+        assert stopped.wait(5) and child.poll() is not None, "shutdown left a media subprocess running"
+
     for fallback in (False, True):
         process = Mock()
         process.poll.return_value = None
@@ -231,7 +504,7 @@ def assert_recording_stop_guards() -> None:
         process.terminate.assert_not_called()
         renderer = service.ffmpeg
         args = ["ffmpeg", "-i", "https://example.invalid/private?token=secret", "-i", "local.mp4", "-f", "null", "-"]
-        with patch.object(renderer, "ensure_tools"), patch.object(app.subprocess, "run", side_effect=subprocess.TimeoutExpired(args, 30)):
+        with patch.object(renderer, "ensure_tools"), patch.object(renderer, "_execute", side_effect=subprocess.TimeoutExpired(args, 30)):
             try:
                 renderer._run(args, 30)
             except RuntimeError as exc:
@@ -240,6 +513,182 @@ def assert_recording_stop_guards() -> None:
             else:
                 raise AssertionError("timeout was not reported")
     print("Recording stop checks passed: graceful q, bounded fallback, no UI hard kill, private timeout diagnostics")
+
+
+def assert_fast_recording_exit() -> None:
+    with tempfile.TemporaryDirectory(prefix="liveclip-fast-exit-") as folder:
+        settings = app.Settings(base_dir=folder, danmaku_enabled=False, auto_slice=False,
+                                auto_recover_recording=False)
+        settings.ensure_dirs()
+        renderer = app.FFmpeg(settings, threading.Event())
+        with patch.object(app.shutil, "which", side_effect=lambda name: name), \
+                patch.object(renderer, "_execute", side_effect=app.TaskCancelled("exiting")) as execute:
+            try:
+                renderer.ensure_tools()
+            except app.TaskCancelled:
+                pass
+            else:
+                raise AssertionError("tool check swallowed exit cancellation")
+            execute.assert_called_once()
+        db = app.Database(Path(folder) / "app.db")
+        db.add_room("1", "Fast exit")
+        service = app.RecorderService(settings, db, app.queue.Queue())
+        actual_popen = subprocess.Popen
+        spawned = []
+
+        def capture(args, **kwargs):
+            process = actual_popen(
+                [sys.executable, "-u", "-c",
+                 "import pathlib,sys; pathlib.Path(sys.argv[1]).write_bytes(b'raw segment'); sys.stdin.readline()",
+                 str(args[-1])],
+                stdin=kwargs["stdin"], stdout=kwargs["stdout"], stderr=kwargs["stderr"],
+                creationflags=kwargs["creationflags"],
+            )
+            spawned.append(process)
+            return process
+
+        try:
+            with patch.object(service.ffmpeg, "ensure_tools"), \
+                    patch.object(app.BilibiliClient, "room_info", return_value={"live_status": True, "title": "Fast exit", "room_id": "1"}), \
+                    patch.object(app.BilibiliClient, "stream_urls", return_value=["https://example.invalid/live"]), \
+                    patch.object(app.subprocess, "Popen", side_effect=capture), \
+                    patch.object(service.ffmpeg, "merge_recording_parts") as merge:
+                service.start_recording("1")
+                deadline = time.monotonic() + 5
+                while not list(settings.recordings_path.glob("*.part*.ts")):
+                    assert time.monotonic() < deadline, "recording child did not write a segment"
+                    time.sleep(0.01)
+                started = time.monotonic()
+                service.stop(fast=True)
+                assert time.monotonic() - started < 2.5, "exit waited for validation"
+                merge.assert_not_called()
+            record = db.list_recordings()[0]
+            assert record["status"] == "error" and "尚未合并或校验" in record["error"]
+            assert Path(record["path"]).read_bytes() == b"raw segment"
+            assert spawned and all(process.poll() is not None for process in spawned)
+        finally:
+            for process in spawned:
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=5)
+            service.executor.shutdown(wait=True, cancel_futures=True)
+
+        db = app.Database(Path(folder) / "blocked.db")
+        db.add_room("2", "Blocked URL")
+        service = app.RecorderService(settings, db, app.queue.Queue())
+        entered, release = threading.Event(), threading.Event()
+
+        def blocked_stream(_room):
+            entered.set()
+            assert release.wait(5)
+            return ["https://example.invalid/live"]
+
+        try:
+            with patch.object(service.ffmpeg, "ensure_tools"), \
+                    patch.object(app.BilibiliClient, "room_info", return_value={"live_status": True, "title": "Blocked URL", "room_id": "2"}), \
+                    patch.object(app.BilibiliClient, "stream_urls", side_effect=blocked_stream), \
+                    patch.object(app.subprocess, "Popen") as launch:
+                service.start_recording("2")
+                assert entered.wait(5)
+                started = time.monotonic()
+                assert not service.stop(fast=True), "blocked network worker should remain pending"
+                assert time.monotonic() - started < 2.5
+                assert db.list_recordings()[0]["status"] == "error"
+                release.set()
+                service.executor.shutdown(wait=True)
+                launch.assert_not_called()
+        finally:
+            release.set()
+            service.executor.shutdown(wait=True)
+
+        service = app.RecorderService(settings, db, app.queue.Queue())
+        exited = threading.Event()
+
+        def media():
+            try:
+                service.ffmpeg._execute([sys.executable, "-c", "import time; time.sleep(30)"], 35)
+            except app.TaskCancelled:
+                exited.set()
+
+        worker = threading.Thread(target=media)
+        worker.start()
+        try:
+            deadline = time.monotonic() + 5
+            while not service.ffmpeg._processes:
+                assert time.monotonic() < deadline, "media process did not launch"
+                time.sleep(0.01)
+            process = next(iter(service.ffmpeg._processes))
+            service.stop(fast=True)
+            worker.join(timeout=3)
+            assert exited.is_set() and process.poll() is not None, "managed media child survived exit"
+        finally:
+            service.stop(fast=True)
+            worker.join(timeout=5)
+
+        with patch.object(service, "_resume_persisted_tasks") as resume:
+            service.start()
+            resume.assert_not_called()
+            assert service.stop_event.is_set() and service.monitor_thread is None
+        with patch.object(service.executor, "submit") as submit:
+            service._schedule_task(1, lambda: None)
+            submit.assert_not_called()
+
+        service = app.RecorderService(settings, db, app.queue.Queue())
+        entering, release = threading.Event(), threading.Event()
+
+        def paused_resume():
+            entering.set()
+            assert release.wait(5)
+
+        with patch.object(service, "_resume_persisted_tasks", side_effect=paused_resume):
+            starter = threading.Thread(target=service.start)
+            starter.start()
+            try:
+                assert entering.wait(5)
+                service.stop(fast=True)
+                release.set()
+                starter.join(timeout=3)
+                assert not starter.is_alive() and service.monitor_thread is None, "monitor restarted after close"
+            finally:
+                release.set()
+                starter.join(timeout=5)
+
+        if os.name == "nt":
+            import ctypes
+
+            service = app.RecorderService(settings, db, app.queue.Queue())
+            parent = subprocess.Popen(
+                [sys.executable, "-u", "-c",
+                 "import subprocess,sys,time; child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']); print(child.pid,flush=True); time.sleep(30)"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+            kernel.OpenProcess.restype = ctypes.c_void_p
+            kernel.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            kernel.WaitForSingleObject.restype = ctypes.c_uint32
+            kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+            try:
+                child_pid = int(parent.stdout.readline().strip())
+                child_handle = kernel.OpenProcess(0x00100000, False, child_pid)
+                assert child_handle, "download child exited before cancellation"
+                try:
+                    service.replay_downloader._processes.add(parent)
+                    service.stop(fast=True)
+                    assert parent.poll() is not None
+                    assert kernel.WaitForSingleObject(child_handle, 1500) == 0, "yt-dlp media child survived exit"
+                finally:
+                    kernel.CloseHandle(child_handle)
+            finally:
+                if parent.poll() is None:
+                    subprocess.run(["taskkill", "/T", "/F", "/PID", str(parent.pid)],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   creationflags=subprocess.CREATE_NO_WINDOW, check=False)
+                parent.wait(timeout=5)
+                parent.stdout.close()
+
+    print("Fast exit checks passed: raw segment retained, blocked network does not delay exit or start capture, media subprocess cancelled")
 
 
 def assert_recording_startup_retries() -> None:
@@ -1656,7 +2105,7 @@ def assert_recording_deletion() -> None:
         source = root / "场次.part01.ts"
         base = root / "场次.ts"
         other = root / "场次-extra.mp4"
-        sidecars = [base.with_suffix(suffix) for suffix in (".mp4", ".danmaku.jsonl", ".transcript.json", ".transcript.srt", ".recap.md", ".asr.wav", ".asr.upload.mp3.dashscope-task.json", ".analysis-checkpoint.json")]
+        sidecars = [base.with_suffix(suffix) for suffix in (".mp4", ".danmaku.jsonl", ".transcript.json", ".transcript.srt", ".recap.md", ".asr.wav", ".asr.upload.mp3.dashscope-task.json", ".analysis-checkpoint.json", ".asr.wav.timeline.json")]
         sidecars.extend((root / "场次.part02.ts", source.with_suffix(".asr.wav")))
         for path in [source, other, *sidecars]:
             path.write_text("test", encoding="utf-8")
@@ -2264,6 +2713,7 @@ def assert_hikami_glossary_desktop(output_dir: Path | None = None) -> None:
                     desktop._reanalyze_recording()
                     confirm.assert_called_once()
                     assert confirm.call_args.kwargs["default"] == "no" and "界面测试录播" in confirm.call_args.args[1]
+                    assert "ASR 费用" in confirm.call_args.args[1] and "已校验时间轴" in confirm.call_args.args[1]
                     assert desktop.db.get_task(task_id)["status"] == "complete"
                     schedule.assert_not_called()
                 with patch.object(desktop.service, "_schedule_task") as schedule, patch.object(app.messagebox, "askyesno", return_value=True):
@@ -4208,14 +4658,18 @@ if __name__ == "__main__":
     parser.add_argument("--media-check", type=Path, metavar="OUTPUT_DIR", help="额外执行真实 FFmpeg 重连、混合编码和失败保护检查")
     options = parser.parse_args()
     from workflow_test import run as check_workflow_repairs
+    assert_task_id_formatting()
     check_workflow_repairs()
     from release_check import check_rules
     check_rules()
     assert_editorial_highlights()
     assert_llm_transient_recovery()
     assert_media_resource_limits()
+    assert_asr_timeline_guards()
+    assert_transcript_timeline_guards()
     assert_media_failure_guards()
     assert_recording_stop_guards()
+    assert_fast_recording_exit()
     assert_recording_startup_retries()
     assert_clip_seek_guards()
     assert_hikami_glossary_workflow()
@@ -4252,4 +4706,5 @@ if __name__ == "__main__":
     if options.render_check:
         assert_reference_rendering_with_ffmpeg(options.render_check.resolve())
     if options.media_check:
+        assert_asr_media_timeline_with_ffmpeg(options.media_check.resolve() / "asr-timeline")
         assert_recording_media_with_ffmpeg(options.media_check.resolve())

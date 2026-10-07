@@ -23,7 +23,9 @@ def check_private_visual_review() -> None:
         rid = db.create_recording("1", "review", "复核回归", str(source), app.now_text(), source_type="local", source_id="offline-source")
         db.finish_recording(rid, "complete", str(source), app.now_text(), 90)
         segments = [{"start": 0, "end": 30, "text": "一开始没想到能过关。"}, {"start": 30, "end": 60, "text": "结果挑战成功了。"}]
-        app.write_json_atomic(source.with_suffix(".transcript.json"), {"segments": segments})
+        app.write_json_atomic(source.with_suffix(".transcript.json"), {
+            "segments": segments, "asr_metadata": {"audio_timeline_signature": app.asr_timeline_signature(source)},
+        })
         candidate = {"source": "llm", "start": 0, "end": 60, "title": "挑战成功了", "cover_text": "挑战成功了", "reason": "一场挑战的结果", "review_flags": ["privacy"]}
         package_path = source.with_suffix(".publish.json")
         app.write_json_atomic(package_path, {"candidates": [{**candidate, "render_interval": {"start": 0, "end": 60}}]})

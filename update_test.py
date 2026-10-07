@@ -211,6 +211,9 @@ def check_windows_installer(folder):
 
 
 def run():
+    history_keys = [updates.version_key(row["version"]) for row in updates.LOCAL_HISTORY]
+    assert history_keys and history_keys[0] == updates.version_key(updates.VERSION), "Current version must lead release history"
+    assert history_keys == sorted(set(history_keys), reverse=True), "Release history must be unique and newest first"
     assert updates.version_key("v2026.09.19.10") > updates.version_key("2026.09.19.2")
     assert updates.version_key("2026.09.19") == updates.version_key("2026.09.19.0")
     for bad in ("", "latest", "2026.9", "v2026.09.19-beta", "2026.09.19.2.1", "../../2.0.0"):

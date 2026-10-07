@@ -73,6 +73,7 @@ DEFAULT_DASHSCOPE_ASR_URL = "https://dashscope.aliyuncs.com/api/v1/services/audi
 DEFAULT_DASHSCOPE_TASKS_URL = "https://dashscope.aliyuncs.com/api/v1/tasks"
 DEFAULT_DASHSCOPE_UPLOADS_URL = "https://dashscope.aliyuncs.com/api/v1/uploads"
 DEFAULT_DASHSCOPE_MODEL = "fun-asr"
+ASR_AUDIO_TIMELINE_VERSION = 1
 # DashScope exposes two different asynchronous request contracts.  Keep the
 # names separate: treating Qwen3 as Qwen-Audio silently produces a 400 because
 # Qwen3 expects ``input.file_url`` (singular).
@@ -600,6 +601,19 @@ def format_seconds(value: float | int | None) -> str:
     hours, remainder = divmod(seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def format_task_id(task_id: int | str) -> str:
+    """Format a task ID as a 1..100 suffix with a bijective base-26 letter prefix."""
+    value = int(task_id)
+    if value <= 100:
+        return str(value)
+    prefix_index, suffix = divmod(value - 1, 100)
+    letters = []
+    while prefix_index:
+        prefix_index, remainder = divmod(prefix_index - 1, 26)
+        letters.append(chr(ord("a") + remainder))
+    return "".join(reversed(letters)) + str(suffix + 1)
 
 
 def parse_timecode(value: Any) -> float:
@@ -1899,6 +1913,12 @@ RENDER_SETTING_FIELDS = (
 )
 
 
+def asr_timeline_signature(source: Path) -> str:
+    info = source.stat()
+    payload = [ASR_AUDIO_TIMELINE_VERSION, str(source.resolve()), info.st_size, info.st_mtime_ns]
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
 def clip_render_signature(settings: Settings, transcript_path: Path | None = None) -> str:
     payload: dict[str, Any] = {name: getattr(settings, name) for name in RENDER_SETTING_FIELDS}
     payload["render_version"] = CLIP_RENDER_VERSION
@@ -3111,8 +3131,34 @@ class BilibiliClient:
 class ReplayDownloader:
     """Download a Bilibili replay through an optional yt-dlp executable."""
 
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, cancel_event: threading.Event | None = None):
         self.settings = settings
+        self._cancel_event = cancel_event
+        self._process_lock = threading.Lock()
+        self._processes: set[subprocess.Popen[Any]] = set()
+
+    def cancel(self, target: subprocess.Popen[Any] | None = None) -> None:
+        with self._process_lock:
+            processes = [target] if target else list(self._processes)
+        for process in processes:
+            if process.poll() is not None:
+                continue
+            if os.name == "nt":
+                # yt-dlp can spawn FFmpeg; terminating only the parent leaks it.
+                result = subprocess.run(["taskkill", "/T", "/F", "/PID", str(process.pid)],
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                        timeout=2, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                if result.returncode and process.poll() is None:
+                    raise RuntimeError("无法结束回放下载进程及其媒体子进程")
+            else:
+                process.terminate()
+            try:
+                process.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                if os.name == "nt":
+                    raise RuntimeError("回放下载进程未退出，不能安全关闭程序")
+                process.kill()
+                process.wait()
 
     def _executable(self) -> str:
         configured = str(self.settings.yt_dlp_path or "yt-dlp").strip() or "yt-dlp"
@@ -3200,10 +3246,14 @@ class ReplayDownloader:
         timeout = max(60, int(self.settings.download_timeout or 1800))
         try:
             for attempt in range(retries + 1):
-                if cancel():
+                if cancel() or (self._cancel_event and self._cancel_event.is_set()):
                     raise TaskCancelled("回放下载已取消")
                 progress(f"下载回放（第 {attempt + 1}/{retries + 1} 次）…")
-                process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                with self._process_lock:
+                    if self._cancel_event and self._cancel_event.is_set():
+                        raise TaskCancelled("回放下载已取消")
+                    process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                    self._processes.add(process)
                 started = time.monotonic()
                 output_lines: list[str] = []
                 line_queue: queue.Queue[str | None] = queue.Queue()
@@ -3220,11 +3270,11 @@ class ReplayDownloader:
                 reader.start()
                 try:
                     while True:
-                        if cancel():
-                            process.terminate()
+                        if cancel() or (self._cancel_event and self._cancel_event.is_set()):
+                            self.cancel(process)
                             raise TaskCancelled("回放下载已取消")
                         if time.monotonic() - started > timeout:
-                            process.kill()
+                            self.cancel(process)
                             raise RuntimeError("yt-dlp 下载超时")
                         try:
                             line = line_queue.get(timeout=0.2)
@@ -3245,9 +3295,12 @@ class ReplayDownloader:
                             break
                     code = process.wait(timeout=20)
                 except subprocess.TimeoutExpired as exc:
-                    process.kill()
-                    process.wait(timeout=5)
+                    self.cancel(process)
                     raise RuntimeError("yt-dlp 下载超时") from exc
+                finally:
+                    with self._process_lock:
+                        if process.poll() is not None:
+                            self._processes.discard(process)
                 if code == 0:
                     result = self._find_output(output_dir, stem, before)
                     if result and result.stat().st_size > 0:
@@ -3257,7 +3310,10 @@ class ReplayDownloader:
                 detail = "\n".join(output_lines[-5:])[-1000:]
                 if attempt < retries:
                     progress(f"回放下载失败，{min(30, 2 ** attempt)} 秒后重试")
-                    time.sleep(min(30, 2 ** attempt))
+                    if self._cancel_event:
+                        self._cancel_event.wait(min(30, 2 ** attempt))
+                    else:
+                        time.sleep(min(30, 2 ** attempt))
                 else:
                     raise RuntimeError(f"yt-dlp 下载失败（退出码 {code}）：{detail}")
         finally:
@@ -3280,7 +3336,27 @@ class ReplayDownloader:
                 handle.close()
             args[1:1] = ["--cookies", str(cookie_file)]
         try:
-            completed = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if self._cancel_event is None:
+                completed = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            else:
+                with self._process_lock:
+                    if self._cancel_event.is_set():
+                        raise TaskCancelled("回放发现已取消")
+                    process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                    self._processes.add(process)
+                try:
+                    stdout, stderr = process.communicate(timeout=300)
+                except subprocess.TimeoutExpired:
+                    self.cancel(process)
+                    process.communicate()
+                    raise
+                finally:
+                    with self._process_lock:
+                        if process.poll() is not None:
+                            self._processes.discard(process)
+                if self._cancel_event.is_set():
+                    raise TaskCancelled("回放发现已取消")
+                completed = subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError("回放发现超时") from exc
         finally:
@@ -3624,7 +3700,7 @@ class DanmakuCollector:
         self.thread = threading.Thread(target=self._run, name=f"danmaku-{self.room_id}", daemon=True)
         self.thread.start()
 
-    def stop(self) -> None:
+    def stop(self, timeout: float = 5) -> None:
         self.stop_event.set()
         sock = self._socket
         if sock:
@@ -3637,8 +3713,8 @@ class DanmakuCollector:
             except OSError:
                 pass
         if self.thread and self.thread.is_alive():
-            self.thread.join(timeout=5)
-        if self._file:
+            self.thread.join(timeout=timeout)
+        if self._file and (not self.thread or not self.thread.is_alive()):
             try:
                 self._file.flush()
                 self._file.close()
@@ -3918,6 +3994,11 @@ class DanmakuCollector:
                 except OSError:
                     pass
             self._socket = None
+            if self._file:
+                try:
+                    self._file.close()
+                finally:
+                    self._file = None
 
 
 def normalize_dashscope_model(model: Any) -> str:
@@ -4728,8 +4809,9 @@ class AudioTypeDetector:
     a conservative fallback so a missing TensorFlow install never blocks ASR.
     """
 
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, ffmpeg: FFmpeg | None = None):
         self.settings = settings
+        self.ffmpeg = ffmpeg
         self.last_engine = "none"
 
     def detect(self, audio_path: Path, progress: Callable[[str], None]) -> list[dict[str, Any]]:
@@ -4746,6 +4828,8 @@ class AudioTypeDetector:
                 if result:
                     self.last_engine = "ina-smn"
                     return result
+            except TaskCancelled:
+                raise
             except Exception as exc:
                 progress(f"inaSpeechSegmenter 不可用，改用轻量音频分类：{_redact_secret(exc)}")
                 if mode in {"ina", "inaspeechsegmenter"}:
@@ -4796,15 +4880,13 @@ class AudioTypeDetector:
         output_path = audio_path.with_suffix(audio_path.suffix + ".ina.json")
         command = [python, str(script_path), "--input", str(audio_path), "--output", str(output_path), "--ffmpeg", self.settings.ffmpeg_path]
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        completed = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=max(60, int(self.settings.dashscope_timeout)),
-            creationflags=creationflags,
-        )
+        if self.ffmpeg:
+            completed = self.ffmpeg._execute(command, max(60, int(self.settings.dashscope_timeout)))
+        else:
+            completed = subprocess.run(
+                command, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=max(60, int(self.settings.dashscope_timeout)), creationflags=creationflags,
+            )
         if completed.returncode != 0:
             output_path.unlink(missing_ok=True)
             detail = (completed.stderr or completed.stdout or "").strip()[-500:]
@@ -5014,8 +5096,11 @@ class FFmpeg:
     # Shared across renderers: one media subprocess per app, independent of live capture.
     _media_lock = threading.Lock()
 
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, cancel_event: threading.Event | None = None):
         self.settings = settings
+        self._cancel_event = cancel_event
+        self._process_lock = threading.Lock()
+        self._processes: set[subprocess.Popen[Any]] = set()
         self._tools_key: tuple[str, str] | None = None
         self._tools_lock = threading.Lock()
         self._tool_aliases = {settings.ffmpeg_path: "ffmpeg", settings.ffprobe_path: "ffprobe"}
@@ -5038,7 +5123,7 @@ class FFmpeg:
                     continue
                 try:
                     def output(binary: str, *args: str) -> str:
-                        result = subprocess.run([binary, "-hide_banner", *args], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                        result = self._execute([binary, "-hide_banner", *args], 15)
                         if result.returncode:
                             raise RuntimeError(result.stderr[-250:])
                         return result.stdout
@@ -5057,11 +5142,39 @@ class FFmpeg:
                     self.settings.ffmpeg_path, self.settings.ffprobe_path = resolved
                     self._tools_key = resolved
                     return
+                except TaskCancelled:
+                    raise
                 except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
                     errors.append(str(exc))
             raise RuntimeError("媒体工具检查失败，请在高级设置选择完整的 FFmpeg 与 FFprobe：" + "；".join(errors))
 
+    def _execute(self, args: list[str], timeout: int | None) -> subprocess.CompletedProcess[str]:
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        if self._cancel_event is None:
+            return subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, creationflags=flags)
+        with self._process_lock:
+            if self._cancel_event.is_set():
+                raise TaskCancelled("媒体任务因程序退出而停止")
+            process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                       encoding="utf-8", errors="replace", creationflags=flags)
+            self._processes.add(process)
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+            raise
+        finally:
+            with self._process_lock:
+                if process.poll() is not None:
+                    self._processes.discard(process)
+        if self._cancel_event.is_set():
+            raise TaskCancelled("媒体任务因程序退出而停止")
+        return subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
+
     def _run(self, args: list[str], timeout: int | None = None) -> tuple[int, str, str]:
+        if self._cancel_event and self._cancel_event.is_set():
+            raise TaskCancelled("媒体任务因程序退出而停止")
         self.ensure_tools()
         args = list(args)
         is_ffmpeg = self._tool_aliases[args[0]] == "ffmpeg"
@@ -5079,7 +5192,7 @@ class FFmpeg:
         try:
             # Queue time is not part of the subprocess timeout; probes stay responsive.
             with FFmpeg._media_lock if is_ffmpeg else nullcontext():
-                completed = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                completed = self._execute(args, timeout)
         except FileNotFoundError as exc:
             raise RuntimeError(f"找不到 FFmpeg/FFprobe: {args[0]}") from exc
         except subprocess.TimeoutExpired as exc:
@@ -5087,6 +5200,31 @@ class FFmpeg:
             inputs = [Path(args[index + 1]).name for index, arg in enumerate(args[:-1]) if arg == "-i" and not args[index + 1].startswith(("http:", "https:"))]
             raise RuntimeError(f"{operation}命令超时（{timeout} 秒）：{Path(args[0]).name}，输入：{'、'.join(inputs) or '未指定本地文件'}") from exc
         return completed.returncode, completed.stdout, completed.stderr
+
+    def cancel(self) -> None:
+        with self._process_lock:
+            processes = list(self._processes)
+        for process in processes:
+            if process.poll() is None:
+                if os.name == "nt":
+                    result = subprocess.run(["taskkill", "/T", "/F", "/PID", str(process.pid)],
+                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                            timeout=2, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                    if result.returncode and process.poll() is None:
+                        raise RuntimeError("媒体进程树未能退出")
+                else:
+                    try:
+                        process.terminate()
+                    except OSError:
+                        if process.poll() is None:
+                            raise
+                try:
+                    process.wait(timeout=0.3)
+                except subprocess.TimeoutExpired:
+                    if os.name == "nt":
+                        raise RuntimeError("媒体进程未能退出")
+                    process.kill()
+                    process.wait(timeout=1)
 
     def duration(self, path: Path) -> float:
         code, stdout, stderr = self._run([self.settings.ffprobe_path, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(path)], 60)
@@ -5300,18 +5438,22 @@ class FFmpeg:
         return destination
 
     def extract_audio(self, source: Path, destination: Path) -> Path:
-        """Create a stable mono 16 kHz PCM WAV for cloud ASR/classification."""
+        """Keep media-time gaps and delayed audio starts in the ASR sample clock."""
         if not source.exists() or source.stat().st_size == 0:
             raise RuntimeError("录播文件为空，无法提取音频")
         destination.parent.mkdir(parents=True, exist_ok=True)
+        signature = asr_timeline_signature(source)
+        timeline_path = destination.with_suffix(destination.suffix + ".timeline.json")
         try:
-            source_mtime = source.stat().st_mtime_ns
             cached_info = destination.stat()
-            if cached_info.st_size > 44 and cached_info.st_mtime_ns >= source_mtime:
+            cached_timeline = json.loads(timeline_path.read_text(encoding="utf-8"))
+            if cached_info.st_size > 44 and cached_timeline == {
+                "signature": signature, "audio_size": cached_info.st_size, "audio_mtime_ns": cached_info.st_mtime_ns,
+            }:
                 with wave.open(str(destination), "rb") as cached_audio:
-                    if cached_audio.getnchannels() == 1 and cached_audio.getframerate() == 16000 and cached_audio.getsampwidth() == 2:
+                    if cached_audio.getnchannels() == 1 and cached_audio.getframerate() == 16000 and cached_audio.getsampwidth() == 2 and cached_audio.getnframes() > 0:
                         return destination
-        except (OSError, wave.Error):
+        except (OSError, ValueError, UnicodeError, wave.Error, EOFError):
             pass
         temporary = destination.with_suffix(destination.suffix + ".partial")
         temporary.unlink(missing_ok=True)
@@ -5329,6 +5471,10 @@ class FFmpeg:
             "-vn",
             "-sn",
             "-dn",
+            # WAV has no packet timestamps. Fill gaps before flattening to samples;
+            # otherwise each reconnect advances every subsequent subtitle.
+            "-af",
+            "aresample=async=1:first_pts=0",
             "-ac",
             "1",
             "-ar",
@@ -5339,23 +5485,26 @@ class FFmpeg:
             "wav",
             str(temporary),
         ]
-        code, _, stderr = self._run(args, 1800)
         try:
+            code, _, stderr = self._run(args, 1800)
             valid = temporary.exists() and temporary.stat().st_size > 44
-        except OSError:
-            valid = False
-        if code != 0 or not valid:
-            temporary.unlink(missing_ok=True)
-            detail = stderr[-600:].strip()
-            raise RuntimeError(f"提取 ASR 音频失败{(': ' + detail) if detail else ''}")
-        try:
+            if code != 0 or stderr.strip() or not valid:
+                detail = stderr[-600:].strip()
+                raise RuntimeError(f"提取 ASR 音频失败{(': ' + detail) if detail else ''}")
             with wave.open(str(temporary), "rb") as audio:
-                if audio.getnchannels() != 1 or audio.getframerate() != 16000 or audio.getsampwidth() != 2:
+                if audio.getnchannels() != 1 or audio.getframerate() != 16000 or audio.getsampwidth() != 2 or audio.getnframes() == 0:
                     raise RuntimeError("FFmpeg 输出的 ASR 音频参数不符合 16kHz/单声道/PCM16")
-        except (wave.Error, OSError) as exc:
-            temporary.unlink(missing_ok=True)
+            if asr_timeline_signature(source) != signature:
+                raise RuntimeError("提取期间源录播发生变化，请停止录制后重试")
+            os.replace(temporary, destination)
+            info = destination.stat()
+            write_json_atomic(timeline_path, {
+                "signature": signature, "audio_size": info.st_size, "audio_mtime_ns": info.st_mtime_ns,
+            })
+        except (wave.Error, EOFError, OSError) as exc:
             raise RuntimeError(f"ASR 音频校验失败：{exc}") from exc
-        os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
         return destination
 
     def extract_speech_audio(self, source: Path, destination: Path, intervals: list[dict[str, Any]]) -> list[dict[str, float]]:
@@ -6641,6 +6790,15 @@ def load_transcript_segments(path: Path | None) -> list[dict[str, Any]]:
     return [dict(item) for item in raw if isinstance(item, dict)]
 
 
+def load_verified_transcript(source: Path, transcript_path: Path) -> dict[str, Any]:
+    saved = json.loads(transcript_path.read_text(encoding="utf-8"))
+    metadata = saved.get("asr_metadata") if isinstance(saved, dict) else None
+    if (not isinstance(metadata, dict)
+            or metadata.get("audio_timeline_signature") != asr_timeline_signature(source)):
+        raise RuntimeError("已有转写未验证音视频时间轴，或源录播已改变；请先重新识别语音，不要复用旧转写。原文件已保留。")
+    return saved
+
+
 def recording_transcript_path(record: dict[str, Any]) -> Path:
     source = Path(str(record.get("path") or ""))
     configured = str(record.get("transcript_path") or "").strip()
@@ -6648,6 +6806,13 @@ def recording_transcript_path(record: dict[str, Any]) -> Path:
         return source.with_suffix(".transcript.json")
     path = Path(configured)
     return path if path.is_absolute() else source.parent / path
+
+
+def can_reuse_transcript(record: dict[str, Any]) -> bool:
+    try:
+        return bool(load_verified_transcript(Path(record["path"]), recording_transcript_path(record)).get("segments"))
+    except (OSError, ValueError, UnicodeError, RuntimeError):
+        return False
 
 
 def _format_srt_timestamp(seconds: float) -> str:
@@ -6719,7 +6884,7 @@ class DashScopeTranscriber:
         self.opener = opener or self._open_request
         self.uploader = uploader or _stream_multipart_upload
         self.ffmpeg = ffmpeg
-        self.detector = AudioTypeDetector(settings)
+        self.detector = AudioTypeDetector(settings, ffmpeg)
         self.last_audio_types: list[dict[str, Any]] = []
         self.last_cloud_metrics: dict[str, Any] = {}
         self.last_metadata: dict[str, Any] = {}
@@ -8461,9 +8626,10 @@ class RecorderService:
         self.events = events
         self.client = BilibiliClient(lambda: self._cookie_for("download"))
         self.uploader = BilibiliUploader(lambda: self._cookie_for("publish"))
-        self.ffmpeg = FFmpeg(settings)
+        self._fast_stop = threading.Event()
+        self.ffmpeg = FFmpeg(settings, self._fast_stop)
         self.transcriber = Transcriber(settings, self.ffmpeg)
-        self.replay_downloader = ReplayDownloader(settings)
+        self.replay_downloader = ReplayDownloader(settings, self._fast_stop)
         self.executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="liveclip")
         self._glossary_jobs: set[tuple[str, str, int | None]] = set()
         self._glossary_jobs_lock = threading.Lock()
@@ -8513,7 +8679,7 @@ class RecorderService:
 
     def _schedule_task(self, task_id: int, runner: Callable[[], Any]) -> None:
         with self._scheduled_lock:
-            if self._update_pending or task_id in self._scheduled_tasks:
+            if self.stop_event.is_set() or self._update_pending or task_id in self._scheduled_tasks:
                 return
             self._scheduled_tasks.add(task_id)
 
@@ -8553,25 +8719,69 @@ class RecorderService:
         self.events.put({"kind": kind, "message": message, "data": data, "time": now_text()})
 
     def start(self) -> None:
-        if self.monitor_thread and self.monitor_thread.is_alive():
-            return
-        self.stop_event.clear()
+        with self._active_lock:
+            if self._fast_stop.is_set() or (self.monitor_thread and self.monitor_thread.is_alive()):
+                return
+            self.stop_event.clear()
         self._resume_persisted_tasks()
-        self.monitor_thread = threading.Thread(target=self._monitor_loop, name="liveclip-monitor", daemon=True)
-        self.monitor_thread.start()
+        with self._active_lock:
+            if self.stop_event.is_set() or self._fast_stop.is_set() or (self.monitor_thread and self.monitor_thread.is_alive()):
+                return
+            self.monitor_thread = threading.Thread(target=self._monitor_loop, name="liveclip-monitor", daemon=True)
+            self.monitor_thread.start()
         self.emit("info", "后台监控已启动")
 
-    def stop(self) -> None:
-        self.stop_event.set()
+    def stop(self, fast: bool = False) -> bool:
+        with self._active_lock:
+            self.stop_event.set()
+            if fast:
+                self._fast_stop.set()
+            states = list(self._active.values())
         if getattr(self, "_qr_cancel", None):
             self._qr_cancel.set()
-        with self._active_lock:
-            states = list(self._active.values())
         for state in states:
             state["stop"].set()
+        if fast:
+            self.ffmpeg.cancel()
+            self.replay_downloader.cancel()
+            deadline = time.monotonic() + 0.65
+            for state in states:
+                future = state.get("future")
+                if future:
+                    try:
+                        future.result(timeout=max(0, deadline - time.monotonic()))
+                    except TimeoutError:
+                        # A network call can outlast the UI. Stop its capture child
+                        # and persist a pointer to the untouched raw segment.
+                        process = state.get("process")
+                        if process and process.poll() is None:
+                            process.kill()
+                            process.wait(timeout=1)
+                        recording_id = state.get("recording_id")
+                        source = state.get("source_path")
+                        if recording_id and source:
+                            parts = self._retained_parts(source)
+                            saved = parts[0] if parts else None
+                            self.db.finish_recording(recording_id, "error", str(saved or source), now_text(), 0,
+                                                     "快速退出：录播分段已保留，尚未合并或校验。" if saved else
+                                                     "快速退出：尚无可保留录播分段。")
+                    except Exception:
+                        logging.exception("录制退出时收尾失败")
+                        raise
+            self.ffmpeg.cancel()
+            self.replay_downloader.cancel()
+            self.executor.shutdown(wait=False, cancel_futures=True)
+            return all(not thread.is_alive() for thread in self.executor._threads)
         if self.monitor_thread and self.monitor_thread.is_alive():
-            self.monitor_thread.join(timeout=3)
-        self.executor.shutdown(wait=False, cancel_futures=True)
+            self.monitor_thread.join()
+        self.executor.shutdown(wait=True, cancel_futures=True)
+        return True
+
+    @staticmethod
+    def _retained_parts(source: Path) -> list[Path]:
+        name = re.compile(re.escape(source.stem) + r"\.part[0-9]+\.ts")
+        return sorted(path for path in source.parent.iterdir()
+                      if name.fullmatch(path.name) and path.is_file() and path.stat().st_size > 0)
 
     def _monitor_loop(self) -> None:
         try:
@@ -8735,7 +8945,7 @@ class RecorderService:
                             ".transcript.srt", ".transcript.corrected.txt", ".transcript.correction.json",
                             ".suggested_terms.json", ".publish.json", ".recap.md", ".silence_map.json", ".analysis-checkpoint.json"}
                 for audio in (".asr.wav", ".vad.asr.wav", ".asr.speech.wav", ".vad.asr.speech.wav"):
-                    suffixes.update((audio, audio + ".dashscope-task.json"))
+                    suffixes.update((audio, audio + ".timeline.json", audio + ".dashscope-task.json"))
                     compressed = audio.removesuffix(".wav") + ".upload.mp3"
                     suffixes.update((compressed, compressed + ".dashscope-task.json"))
                 paths = {source, source.with_suffix(source.suffix + ".info.json")}
@@ -9070,7 +9280,7 @@ class RecorderService:
 
     def cancel_task(self, task_id: int) -> None:
         self.db.request_task_cancel(int(task_id))
-        self.emit("info", f"已请求取消任务 #{int(task_id)}", task_id=int(task_id))
+        self.emit("info", f"已请求取消任务 #{format_task_id(task_id)}", task_id=int(task_id))
 
     def retry_task(self, task_id: int) -> None:
         task = self.db.get_task(int(task_id))
@@ -9102,7 +9312,7 @@ class RecorderService:
 
     def start_recording(self, room_id: str) -> None:
         with self._active_lock:
-            if self._update_pending or room_id in self._active:
+            if self._fast_stop.is_set() or self.stop_event.is_set() or self._update_pending or room_id in self._active:
                 return
             self._recovery.pop(room_id, None)
             state: dict[str, Any] = {"stop": threading.Event(), "process": None, "recording_id": None, "danmaku_collector": None, "manual_stop": False}
@@ -9122,7 +9332,7 @@ class RecorderService:
         self.emit("info", f"正在停止房间 {room_id} 的录制…", room_id=room_id)
 
     @staticmethod
-    def _stop_process(process: subprocess.Popen[Any] | None) -> None:
+    def _stop_process(process: subprocess.Popen[Any] | None, fast: bool = False) -> None:
         if not process:
             return
         stdin = process.stdin
@@ -9137,17 +9347,17 @@ class RecorderService:
             except (OSError, ValueError):
                 pass
             try:
-                process.wait(timeout=20)
+                process.wait(timeout=0.3 if fast else 20)
             except subprocess.TimeoutExpired:
                 try:
                     process.terminate()
                 except OSError:
                     pass
                 try:
-                    process.wait(timeout=5)
+                    process.wait(timeout=0.2 if fast else 5)
                 except subprocess.TimeoutExpired:
                     process.kill()
-                    process.wait(timeout=5)
+                    process.wait(timeout=1 if fast else 5)
         finally:
             if stdin:
                 try:
@@ -9194,7 +9404,7 @@ class RecorderService:
             room_account_id = int(room_config.get("account_id") or 0)
             room_client = BilibiliClient(lambda: self._cookie_for("download", room_account_id))
             info = room_client.room_info(room_id)
-            if not info["live_status"]:
+            if not info["live_status"] or self._fast_stop.is_set():
                 return
             started_at = now_text()
             started_wall = time.time()
@@ -9203,6 +9413,9 @@ class RecorderService:
             title = str(info.get("title") or room_id)
             basename = render_filename(f"{room_id}_{live_id}_{title}", 100)
             source_path = self.settings.recordings_path / f"{basename}.ts"
+            state["source_path"] = source_path
+            if self._fast_stop.is_set():
+                return
             final_path = source_path.with_suffix(".mp4")
             danmaku_path = source_path.with_suffix(".danmaku.jsonl")
             ffmpeg_log_path = self.settings.data_path / "logs" / f"{basename}.ffmpeg.log"
@@ -9227,10 +9440,15 @@ class RecorderService:
                 },
             )
             state["recording_id"] = recording_id
+            if self._fast_stop.is_set():
+                self.db.finish_recording(recording_id, "error", str(source_path), now_text(), 0,
+                                         "快速退出：尚无可保留录播分段。")
+                finished = True
+                return
             self.db.set_recording_danmaku_path(recording_id, str(danmaku_path))
             self.db.set_recording_status(recording_id, "recording")
             self.emit("recording", f"开始录制：{title}", room_id=room_id, recording_id=recording_id)
-            if self.settings.danmaku_enabled:
+            if self.settings.danmaku_enabled and not self._fast_stop.is_set():
                 try:
                     collector = DanmakuCollector(
                         room_client,
@@ -9253,6 +9471,8 @@ class RecorderService:
             while not state["stop"].is_set() and not self.stop_event.is_set():
                 try:
                     stream_urls = room_client.stream_urls(room_id)
+                    if self._fast_stop.is_set():
+                        break
                     stream_url = stream_urls[retries_used % len(stream_urls)]
                 except Exception as exc:
                     last_return_code = None
@@ -9299,11 +9519,14 @@ class RecorderService:
                 ffmpeg_log.write(f"\n[{now_text()}] attempt {retries_used + 1}\n".encode("utf-8"))
                 ffmpeg_log.flush()
                 try:
-                    process = subprocess.Popen(ffmpeg_args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=ffmpeg_log, bufsize=0, creationflags=creationflags)
-                except Exception:
-                    ffmpeg_log.close()
-                    raise
-                state["process"] = process
+                    with self._active_lock:
+                        if self._fast_stop.is_set():
+                            break
+                        process = subprocess.Popen(ffmpeg_args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=ffmpeg_log, bufsize=0, creationflags=creationflags)
+                        state["process"] = process
+                finally:
+                    if state.get("process") is None:
+                        ffmpeg_log.close()
                 last_size = 0
                 last_growth = time.monotonic()
                 while process.poll() is None and not state["stop"].is_set() and not self.stop_event.is_set():
@@ -9319,7 +9542,7 @@ class RecorderService:
                         self.emit("warning", f"录播文件 {self.settings.record_stall_seconds} 秒未增长，重启流连接", recording_id=recording_id)
                         self._stop_process(process)
                         break
-                self._stop_process(process)
+                self._stop_process(process, fast=self._fast_stop.is_set())
                 last_return_code = process.poll()
                 state["process"] = None
                 ffmpeg_log.close()
@@ -9354,9 +9577,17 @@ class RecorderService:
                     break
 
             if collector:
-                collector.stop()
+                collector.stop(timeout=0.5 if self._fast_stop.is_set() else 5)
                 state["danmaku_collector"] = None
-            if parts:
+            if self._fast_stop.is_set() and not parts:
+                parts = self._retained_parts(source_path)
+            if parts and self._fast_stop.is_set():
+                final_path = parts[0]
+                self.db.finish_recording(recording_id, "error", str(final_path), now_text(), 0,
+                                         f"快速退出：已保留 {len(parts)} 个原始分段，尚未合并或校验。")
+                finished = True
+                self.emit("recording_done", f"录播分段已保存：{title}（待校验）", recording_id=recording_id)
+            elif parts:
                 # On failure the record must point to retained media, not a partial MP4.
                 final_path = parts[0]
                 self.emit("info", "录播分段已保存，正在合并并校验完整音视频…", recording_id=recording_id)
@@ -9366,13 +9597,18 @@ class RecorderService:
                 error = "" if status == "complete" else f"FFmpeg 退出码 {last_return_code}"
                 self.db.finish_recording(recording_id, status, str(final_path), now_text(), duration, error)
                 finished = True
-                for part in parts:
+                for part in parts if not self._fast_stop.is_set() else ():
                     part.unlink(missing_ok=True)
                 self._recovery.pop(room_id, None)
                 self.emit("recording_done", f"录播完成：{title}（{format_seconds(duration)}）", recording_id=recording_id)
                 if status == "complete" and not self.stop_event.is_set() and bool(room_config.get("auto_asr", 1)) and bool(self.settings.auto_slice):
                     self.analyze_recording(recording_id)
             else:
+                if self._fast_stop.is_set():
+                    self.db.finish_recording(recording_id, "error", str(source_path), now_text(), 0,
+                                             "快速退出：尚无可保留录播分段。")
+                    finished = True
+                    return
                 detail = ""
                 try:
                     log_lines = [line.strip() for line in ffmpeg_log_path.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
@@ -9389,22 +9625,29 @@ class RecorderService:
         except Exception as exc:
             detail = f"录制失败：{exc}"
             retained_duration = 0.0
+            if self._fast_stop.is_set() and not parts and source_path:
+                parts = self._retained_parts(source_path)
             if parts:
-                for part in parts:
-                    try:
-                        duration = self.ffmpeg.duration(part)
-                        if math.isfinite(duration) and duration > 0:
-                            retained_duration += duration
-                    except (OSError, RuntimeError, ValueError):
-                        pass
+                if not self._fast_stop.is_set():
+                    for part in parts:
+                        try:
+                            duration = self.ffmpeg.duration(part)
+                            if math.isfinite(duration) and duration > 0:
+                                retained_duration += duration
+                        except (OSError, RuntimeError, ValueError):
+                            pass
+                final_path = parts[0]
                 detail = f"录播收尾失败（已保留 {len(parts)} 个原始分段，探测时长 {format_seconds(retained_duration)}，尚未通过完整校验）：{exc}"
             if collector:
-                collector.stop()
+                collector.stop(timeout=0.5 if self._fast_stop.is_set() else 5)
             if recording_id is not None and not finished:
                 self.db.finish_recording(recording_id, "error", str(final_path or source_path or ""), now_text(), retained_duration, detail)
             self.emit("error", detail, room_id=room_id, recording_id=recording_id)
             self._schedule_recording_recovery(room_id, state)
         finally:
+            process = state.get("process")
+            if process and process.poll() is None:
+                self._stop_process(process, fast=self._fast_stop.is_set())
             with self._active_lock:
                 if self._active.get(room_id) is state:
                     self._active.pop(room_id, None)
@@ -9512,8 +9755,9 @@ class RecorderService:
             try:
                 reuse_transcript = bool(task_payload.get("reuse_transcript"))
                 provider = self.settings.transcription_provider.strip().lower() or "dashscope"
+                timeline_signature = asr_timeline_signature(path)
                 if reuse_transcript:
-                    saved = json.loads(recording_transcript_path(record).read_text(encoding="utf-8"))
+                    saved = load_verified_transcript(path, recording_transcript_path(record))
                     segments = saved.get("segments") or []
                     if not segments:
                         raise RuntimeError("没有可复用的转写，请先重新识别语音")
@@ -9530,14 +9774,14 @@ class RecorderService:
                     if bool(getattr(self.settings, "vad_enabled", False)):
                         try:
                             self.emit("analysis", "执行独立静音 VAD…", recording_id=recording_id)
-                            vad_map = self.ffmpeg.detect_silence(path, duration)
+                            vad_map = self.ffmpeg.detect_silence(asr_audio_path, duration)
                             vad_path = path.with_suffix(".silence_map.json")
                             temporary_vad = vad_path.with_suffix(vad_path.suffix + ".partial")
                             temporary_vad.write_text(json.dumps(vad_map, ensure_ascii=False, indent=2), encoding="utf-8")
                             os.replace(temporary_vad, vad_path)
                             if bool(getattr(self.settings, "vad_filter_asr", False)) and vad_map.get("speech_intervals"):
                                 filtered_path = path.with_suffix(".vad.asr.wav")
-                                vad_timeline = self.ffmpeg.extract_intervals_audio(path, filtered_path, vad_map["speech_intervals"])
+                                vad_timeline = self.ffmpeg.extract_intervals_audio(asr_audio_path, filtered_path, vad_map["speech_intervals"])
                                 asr_audio_path = filtered_path
                                 asr_duration = vad_timeline[-1]["trimmed_end"] if vad_timeline else duration
                         except Exception as exc:
@@ -9546,6 +9790,9 @@ class RecorderService:
                     segments = self.transcriber.transcribe(asr_audio_path, analysis_progress, asr_duration, vocabulary)
                     if vad_timeline:
                         segments = remap_trimmed_segments(segments, vad_timeline, duration)
+                if asr_timeline_signature(path) != timeline_signature:
+                    raise RuntimeError("识别期间源录播发生变化，请重新识别语音")
+                self.transcriber.last_metadata["audio_timeline_signature"] = timeline_signature
             except Exception as exc:
                 if isinstance(exc, TaskCancelled):
                     raise
@@ -9853,6 +10100,8 @@ class RecorderService:
         candidate_data = dict(candidate or {})
         if auto and candidate_data.get("source") == "heuristic":
             raise RuntimeError("旧规则候选尚未经过事件选题与标题编辑，请重新分析高光后再生成切片")
+        if transcript_path.is_file() and (auto or bool(getattr(self.settings, "subtitle_burn_enabled", True))):
+            load_verified_transcript(source, transcript_path)
         source_segments: list[dict[str, Any]] = []
         source_danmaku: list[dict[str, Any]] = []
         if not candidate_data:
@@ -12100,7 +12349,7 @@ class DesktopApp:
         try:
             task_id = self.service.import_media(Path(source), Path(danmaku) if danmaku else None, title)
             self._select_notebook_tab("任务")
-            self._append_log(f"媒体导入任务已创建：#{task_id}")
+            self._append_log(f"媒体导入任务已创建：#{format_task_id(task_id)}")
         except Exception as exc:
             messagebox.showerror("导入失败", str(exc), parent=self.root)
 
@@ -12131,7 +12380,7 @@ class DesktopApp:
                 source_liver_name=str(item.get("source_liver_name") or ""),
             )
             self._select_notebook_tab("任务")
-            self._append_log(f"已加入回放下载任务：#{task_id}")
+            self._append_log(f"已加入回放下载任务：#{format_task_id(task_id)}")
         except Exception as exc:
             messagebox.showerror("下载失败", str(exc), parent=self.root)
 
@@ -12269,12 +12518,12 @@ class DesktopApp:
         if not Path(record["path"]).is_file():
             messagebox.showerror("无法重新总结", "录播文件不存在，请先补导入录播。", parent=self.root)
             return
-        if not messagebox.askyesno("重新 AI 总结切片", f"是否重新对「{str(record['title'])[:100]}」进行 AI 总结切片？\n\n将更新总结与高光，并按当前投稿设置处理新切片。已有成片和稿件会保留。\n已有转写会复用；没有转写时先识别语音。", parent=self.root, default="no"):
+        if not messagebox.askyesno("重新 AI 总结切片", f"是否重新对「{str(record['title'])[:100]}」进行 AI 总结切片？\n\n将更新总结与高光，并按当前投稿设置处理新切片。已有成片和稿件会保留。\n仅复用已校验时间轴的转写；没有或旧版转写时重新云端识别，可能产生 ASR 费用。", parent=self.root, default="no"):
             return
         try:
-            task_id = self.service.analyze_recording(int(iid), force=True, reuse_transcript=recording_transcript_path(record).is_file(), run_pipeline=True)
+            task_id = self.service.analyze_recording(int(iid), force=True, reuse_transcript=can_reuse_transcript(record), run_pipeline=True)
             self._refresh_tasks()
-            self._append_log(f"AI 总结切片任务 #{task_id} 已加入；进行中的任务不会重复启动。")
+            self._append_log(f"AI 总结切片任务 #{format_task_id(task_id)} 已加入；进行中的任务不会重复启动。")
         except Exception as exc:
             messagebox.showerror("重新总结失败", str(exc), parent=self.root)
 
@@ -12574,7 +12823,7 @@ class DesktopApp:
                 "",
                 END,
                 iid=str(task["id"]),
-                values=(task["id"], labels.get(str(task.get("kind")), task.get("kind")), STATUS_LABELS.get(task.get("status"), task.get("status")), f"{float(task.get('progress') or 0):.0f}%", task.get("message") or "", task.get("attempts") or 0, task.get("updated_at") or "", task.get("error") or ""),
+                values=(format_task_id(task["id"]), labels.get(str(task.get("kind")), task.get("kind")), STATUS_LABELS.get(task.get("status"), task.get("status")), f"{float(task.get('progress') or 0):.0f}%", task.get("message") or "", task.get("attempts") or 0, task.get("updated_at") or "", task.get("error") or ""),
             )
         self._update_table_state(self.task_tree)
         if selected and self.task_tree.exists(selected):
@@ -13466,6 +13715,7 @@ def run_self_test() -> None:
         transcript_path.write_text(
             json.dumps(
                 {
+                    "asr_metadata": {"audio_timeline_signature": asr_timeline_signature(source)},
                     "segments": [
                         {"start": 0.5, "end": 1.5, "text": "为什么要挑战这个问题？", "speaker_id": 1},
                         {"start": 1.5, "end": 2.5, "text": "我们继续分析，然后尝试解决。", "speaker_id": 1},

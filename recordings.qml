@@ -457,7 +457,7 @@ ApplicationWindow {
                                 onClicked: { tasks.currentIndex = index; window.selectedTask = rowData.id }
                                 contentItem: ColumnLayout {
                                     id: taskContent
-                                    Label { textFormat: Text.PlainText; text: "#" + taskRow.rowData.id + "  " + taskRow.rowData.kind + "  ·  " + taskRow.rowData.status + "  " + Number(taskRow.rowData.progress).toFixed(0) + "%"; font.bold: true }
+                                    Label { textFormat: Text.PlainText; text: "#" + taskRow.rowData.displayId + "  " + taskRow.rowData.kind + "  ·  " + taskRow.rowData.status + "  " + Number(taskRow.rowData.progress).toFixed(0) + "%"; font.bold: true }
                                     Label { textFormat: Text.PlainText; text: taskRow.rowData.message || ""; wrapMode: Text.Wrap; Layout.fillWidth: true }
                                     Label { textFormat: Text.PlainText; text: taskRow.rowData.error || ""; color: uiTheme.current.colors.danger; visible: text.length > 0; wrapMode: Text.Wrap; Layout.fillWidth: true }
                                     Label { textFormat: Text.PlainText; text: taskRow.rowData.updated + "  ·  尝试 " + taskRow.rowData.attempts + " 次"; color: uiTheme.current.colors.muted; font.pixelSize: 12 }
@@ -623,7 +623,7 @@ ApplicationWindow {
             standardButton(Dialog.No).forceActiveFocus()
         }
         onAccepted: bridge.command("analyze", String(window.confirmationId))
-        Label { textFormat: Text.PlainText; width: parent.width; wrapMode: Text.Wrap; text: "是否重新对「" + window.confirmationTitle + "」进行 AI 总结切片？\n\n将更新总结与高光，并按当前投稿设置处理新切片。已有成片和稿件会保留。\n已有转写会复用；没有转写时先识别语音。" }
+        Label { textFormat: Text.PlainText; width: parent.width; wrapMode: Text.Wrap; text: "是否重新对「" + window.confirmationTitle + "」进行 AI 总结切片？\n\n将更新总结与高光，并按当前投稿设置处理新切片。已有成片和稿件会保留。\n仅复用已校验时间轴的转写；没有或旧版转写时重新云端识别，可能产生 ASR 费用。" }
     }
     AppDialog {
         id: errorDialog

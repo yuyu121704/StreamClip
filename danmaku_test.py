@@ -12,12 +12,18 @@ from unittest.mock import Mock, patch
 import app
 
 
+class CapturedFile(io.StringIO):
+    def close(self):
+        self.saved_text = self.getvalue()
+        super().close()
+
+
 def collector(client=None):
     result = app.DanmakuCollector(
         client or app.BilibiliClient(lambda: ""), "123", Path("unused.jsonl"),
         0, 0, 3, Mock(),
     )
-    result._file = io.StringIO()
+    result._file = CapturedFile()
     return result
 
 
@@ -243,11 +249,13 @@ def check_recovery():
         return False
 
     history = [{"text": "history chat", "timestamp": 10, "uid": 7}]
+    output = value._file
     with patch.object(client, "danmaku_info", side_effect=info), patch.object(client, "danmaku_history", return_value=history) as poll, patch.object(value, "_connect_ws", return_value=Mock()), patch.object(value, "_recv_ws_frame", side_effect=receive), patch.object(app.time, "monotonic", side_effect=lambda: clock[0]), patch.object(value.stop_event, "wait", side_effect=wait):
         value._run()
     assert attempts == ["expired-token", "fresh-token"]
     assert poll.call_count == 10
-    assert len(value._file.getvalue().splitlines()) == 1, "Repeated history was not deduplicated"
+    assert output.closed and value._file is None
+    assert len(output.saved_text.splitlines()) == 1, "Repeated history was not deduplicated"
     assert any("鉴权成功" in call.args[0] for call in value.emit.call_args_list)
     assert value._socket is None
 

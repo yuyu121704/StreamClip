@@ -242,6 +242,7 @@ class Bridge(QObject):
         self._asr_models_request = 0
         self._asr_model_credentials = settings.dashscope_api_key
         self._network = ThreadPoolExecutor(max_workers=2, thread_name_prefix="quick-network")
+        self._tool_checks = []
         self._detail = recording_detail(None)
         self._selected = 0
         self._status = "正在读取录播…"
@@ -519,7 +520,7 @@ class Bridge(QObject):
         rooms = {str(r["room_id"]): r for r in self.db.list_rooms()}
         rows = [{"id": r["id"], "title": r["title"], "status": core.STATUS_LABELS.get(r["status"], r["status"]), "duration": core.format_seconds(r["duration"]), "source": {"live": "直播", "replay": "回放", "local": "本地"}.get(r.get("source_type"), "直播"), "room": r["room_id"], "started": r["started_at"], **media_origin(r, rooms)} for r in records]
         labels = {"analysis": "分析", "clip": "切片", "upload": "投稿", "replay_download": "回放下载", "media_import": "媒体导入"}
-        tasks = [{"id": t["id"], "kind": labels.get(t["kind"], t["kind"]), "state": t["status"], "status": core.STATUS_LABELS.get(t["status"], t["status"]), "progress": t["progress"], "message": t["message"], "error": t["error"], "updated": t["updated_at"], "attempts": t["attempts"]} for t in self.db.list_tasks(-1)]
+        tasks = [{"id": t["id"], "displayId": core.format_task_id(t["id"]), "kind": labels.get(t["kind"], t["kind"]), "state": t["status"], "status": core.STATUS_LABELS.get(t["status"], t["status"]), "progress": t["progress"], "message": t["message"], "error": t["error"], "updated": t["updated_at"], "attempts": t["attempts"]} for t in self.db.list_tasks(-1)]
         record = self.db.get_recording(selected) if any(r["id"] == selected for r in records) else None
         transcript = Path(str((record or {}).get("transcript_path") or ""))
         try:
@@ -763,10 +764,10 @@ class Bridge(QObject):
                     raise ValueError("请选择存在的媒体文件")
                 chat = self.filePath(str(values.get("danmaku") or ""))
                 task = self.service.import_media(source, Path(chat) if chat else None, str(values.get("title") or source.stem))
-                message = f"媒体导入任务 #{task} 已加入"
+                message = f"媒体导入任务 #{core.format_task_id(task)} 已加入"
             elif action == "replayDownload":
                 task = self.service.download_replay(str(values.get("url") or values.get("bvid") or ""), str(values.get("title") or "回放"), source_liver_uid=str(values.get("source_liver_uid") or ""), source_liver_name=str(values.get("source_liver_name") or ""))
-                message = f"回放下载任务 #{task} 已加入"
+                message = f"回放下载任务 #{core.format_task_id(task)} 已加入"
             elif action == "cleanup":
                 kind, ids = values.get("kind"), values.get("ids")
                 if kind == "tasks":
@@ -819,9 +820,11 @@ class Bridge(QObject):
                 message = "设置已保存，新任务立即生效"
             elif action == "checkTools":
                 settings = replace(self.settings, ffmpeg_path=str(values.get("ffmpeg_path") or "ffmpeg"), ffprobe_path=str(values.get("ffprobe_path") or "ffprobe"))
+                renderer = core.FFmpeg(settings, self.service._fast_stop)
+                self._tool_checks.append(renderer)
                 def check():
                     try:
-                        core.FFmpeg(settings).ensure_tools()
+                        renderer.ensure_tools()
                         return "媒体工具检查通过"
                     except Exception as exc:
                         return "媒体工具检查失败：" + str(exc)
@@ -944,8 +947,8 @@ class Bridge(QObject):
                     raise ValueError("录播仍在写入，请结束录制后再操作。")
                 if not Path(record["path"]).is_file():
                     raise ValueError("录播文件不存在，请先补导入录播。")
-                task_id = self.service.analyze_recording(target, force=True, reuse_transcript=core.recording_transcript_path(record).is_file(), run_pipeline=True)
-                return f"AI 总结切片任务 #{task_id} 已加入；进行中的任务不会重复启动。"
+                task_id = self.service.analyze_recording(target, force=True, reuse_transcript=core.can_reuse_transcript(record), run_pipeline=True)
+                return f"AI 总结切片任务 #{core.format_task_id(task_id)} 已加入；进行中的任务不会重复启动。"
             task = self.db.get_task(target)
             if not task:
                 raise ValueError("任务已不存在，请刷新后重试。")
@@ -973,12 +976,13 @@ class Bridge(QObject):
                     self._update.update(state="ready", error="退出失败，更新已停止；可以重试。")
                     self.updateChanged.emit()
                 self._closing = False
+                self._status = "退出未完成，请再次关闭以重试：" + str(result)
                 self.timer.start()
                 self.update_timer.start()
                 self.error.emit(str(result))
                 self.changed.emit()
                 return
-            self._pool.shutdown(wait=False)
+            self._pool.shutdown(wait=False, cancel_futures=True)
             self._network.shutdown(wait=False, cancel_futures=True)
             self.closed.emit()
             return
@@ -1079,10 +1083,21 @@ class Bridge(QObject):
         self.update_startup.stop()
         self._update_cancel.set()
         self.cancelQr()
-        self._status = "正在停止后台服务…"
+        self._status = "正在保存录播分段并停止媒体进程…"
         self.timer.stop()
         self.changed.emit()
-        self._submit("close", self.service.stop)
+
+        def stop_services():
+            try:
+                result = self.service.stop(fast=True)
+                for renderer in self._tool_checks:
+                    renderer.cancel()
+            except Exception as exc:
+                logging.exception("Qt Quick close failed")
+                result = exc
+            self._result.emit("close", result)
+
+        threading.Thread(target=stop_services, name="quick-close", daemon=True).start()
 
 
 def create_engine(bridge):
@@ -1169,9 +1184,14 @@ def run():
         if not bridge._closing:
             bridge.service.stop()
             bridge._pool.shutdown(wait=True)
-            bridge._network.shutdown(wait=False, cancel_futures=True)
+            bridge._network.shutdown(wait=True, cancel_futures=True)
         engine.deleteLater()
         logging.shutdown()
+        if bridge._closing and any(thread.is_alive() for executor in (bridge.service.executor, bridge._pool, bridge._network)
+                                   for thread in executor._threads):
+            # After recorder data and managed children are settled, stalled
+            # network threads must not keep the windowed process invisible.
+            os._exit(0)
 
 
 if __name__ == "__main__":
