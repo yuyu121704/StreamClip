@@ -978,9 +978,12 @@ def review_flags_for_candidate(
 
 
 def _clean_title_text(value: Any, limit: int = 64) -> str:
-    text = re.sub(r"\s+", " ", str(value or "").replace("\r", " ").replace("\n", " ")).strip()
-    text = re.sub(r"[\x00-\x1f]", "", text)
-    return text[:limit]
+    text = re.sub(r"[\x00-\x1f\x7f-\x9f]", lambda match: " " if match[0].isspace() else "", str(value or ""))
+    return " ".join(text.split())[:limit]
+
+
+def clean_publish_title(title: str) -> str:
+    return _clean_title_text(title, 80).rstrip() or "直播切片"
 
 
 def build_title_candidates(
@@ -2431,7 +2434,7 @@ class Database:
             cursor = conn.execute(
                 """INSERT INTO uploads(clip_id,title,description,tags,tid,account_id,task_id,status,metadata_json,created_at,updated_at)
                    VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-                (clip_id, title, description, tags, tid, int(account_id or 0), int(task_id or 0), "pending", json.dumps(metadata or {}, ensure_ascii=False), timestamp, timestamp),
+                (clip_id, clean_publish_title(title), description, tags, tid, int(account_id or 0), int(task_id or 0), "pending", json.dumps(metadata or {}, ensure_ascii=False), timestamp, timestamp),
             )
             return int(cursor.lastrowid)
 
@@ -2485,7 +2488,7 @@ class Database:
             conn.execute("UPDATE uploads SET metadata_json=?,updated_at=? WHERE id=?", (json.dumps(metadata or {}, ensure_ascii=False), now_text(), int(upload_id)))
 
     def update_upload_fields(self, upload_id: int, title: str, description: str, tags: str, tid: int) -> None:
-        clean_title = _clean_title_text(title, 80) or "直播切片"
+        clean_title = clean_publish_title(title)
         with self._connect() as conn:
             row = conn.execute("SELECT status FROM uploads WHERE id=?", (int(upload_id),)).fetchone()
             if not row:
@@ -8582,7 +8585,7 @@ class BilibiliUploader:
             "videos": [{"title": "1", "filename": uploaded_filename, "desc": "", "cid": biz_id}],
             "cover": cover_url,
             "cover43": None,
-            "title": safe_filename(title, 80),
+            "title": clean_publish_title(title),
             "copyright": 1,
             "tid": int(tid),
             "tag": ",".join(_normalize_tag_list(tags)),
@@ -13773,15 +13776,19 @@ def run_self_test() -> None:
             fallback_row = render_db.get_upload(render_service.enqueue_upload(clip_id, start=False, account_id=account_id)) or {}
             assert fallback_row["tid"] == 21 and fallback_row["tags"] == "直播切片,AI切片,虚拟主播,实际主播 Name"
             assert "渲染标题" in fallback_row["description"] and "来源：实际主播 Name 直播《渲染录播》" in fallback_row["description"]
+        publish_title = '为什么? 主播说: "不亏" A/B.'
         edited_package_path = source.with_suffix(".publish.json")
         write_json_atomic(edited_package_path, {"candidates": [{
-            "render_interval": {"start": 1, "end": 3}, "title_candidates": ["逐稿标题"],
+            "render_interval": {"start": 1, "end": 3}, "title_candidates": [publish_title],
             "description": "逐稿简介", "tags": ["自选标签", "主播 Name"], "category_suggestion": 171,
         }]})
         edited_row = render_db.get_upload(render_service.enqueue_upload(clip_id, start=False, account_id=3)) or {}
-        assert (edited_row["title"], edited_row["description"], edited_row["tags"], edited_row["tid"]) == ("逐稿标题", "逐稿简介", "自选标签,主播 Name", 171)
+        assert (edited_row["title"], edited_row["description"], edited_row["tags"], edited_row["tid"]) == (publish_title, "逐稿简介", "自选标签,主播 Name", 171)
         explicit_row = render_db.get_upload(render_service.enqueue_upload(clip_id, title="显式标题", description="显式简介", tags="显式标签", tid=27, start=False, account_id=4)) or {}
         assert (explicit_row["title"], explicit_row["description"], explicit_row["tags"], explicit_row["tid"]) == ("显式标题", "显式简介", "显式标签", 27)
+        render_db.update_upload_fields(explicit_row["id"], publish_title + "\t\x00\x7f" + "尾" * 100, "显式简介", "显式标签", 27)
+        manual_title = render_db.get_upload(explicit_row["id"])["title"]
+        assert manual_title == (publish_title + " " + "尾" * 100)[:80]
         edited_package_path.unlink()
         auto_uploads: list[tuple[int, dict[str, Any]]] = []
         original_enqueue_upload = render_service.enqueue_upload
@@ -13866,11 +13873,12 @@ def run_self_test() -> None:
         urllib.request.urlopen = _fake_bilibili_urlopen  # type: ignore[assignment]
         try:
             uploader = BilibiliUploader(lambda: "SESSDATA=test; bili_jct=csrf")
-            assert uploader.upload(video_path, "公开测试", queued_row["description"], queued_row["tags"], queued_row["tid"], cover_path, visibility="public") == "BV-test"
-            assert uploader.upload(video_path, "私密测试", "", "直播切片 AI切片 虚拟主播", 21, cover_path, visibility="self") == "BV-test"
+            assert uploader.upload(video_path, edited_row["title"], queued_row["description"], queued_row["tags"], queued_row["tid"], cover_path, visibility="public") == "BV-test"
+            assert uploader.upload(video_path, manual_title, "", "直播切片 AI切片 虚拟主播", 21, cover_path, visibility="self") == "BV-test"
         finally:
             urllib.request.urlopen = original_urlopen
         assert [profile["is_only_self"] for profile in bilibili_profiles] == [0, 1]
+        assert [profile["title"] for profile in bilibili_profiles] == [publish_title, manual_title]
         assert bilibili_profiles[0]["tid"] == 21 and bilibili_profiles[0]["desc"] == queued_row["description"]
         assert bilibili_profiles[0]["tag"] == "直播切片,AI切片,虚拟主播,渲染测试"
         assert bilibili_profiles[1]["tag"] == "直播切片,AI切片,虚拟主播"
