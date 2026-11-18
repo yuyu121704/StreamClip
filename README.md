@@ -152,7 +152,8 @@ New-Item -ItemType Directory -Force $env:TEMP | Out-Null
 $env:LIVECLIP_UI_TEST_OUTPUT = Join-Path $testRoot 'ui-check'
 $env:LIVECLIP_TEST_FFMPEG = (Resolve-Path .\tools\ffmpeg.exe).Path
 .\.venv\Scripts\python.exe -X utf8 -B release_check.py
-powershell -NoProfile -ExecutionPolicy Bypass -File .\startup_test.ps1
+$env:LIVECLIP_TEST_POWERSHELL = (Get-Process -Id $PID).Path
+& $env:LIVECLIP_TEST_POWERSHELL -NoProfile -ExecutionPolicy Bypass -File .\startup_test.ps1
 .\.venv\Scripts\python.exe -X utf8 -B security_test.py
 .\.venv\Scripts\python.exe -X utf8 -B self_test.py
 .\.venv\Scripts\python.exe -X utf8 -B quick_ui_test.py

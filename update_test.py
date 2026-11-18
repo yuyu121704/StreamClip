@@ -187,7 +187,7 @@ def check_windows_installer(folder):
     }}
     try {{ Install-StreamClipUpdate '{job_path}' }} catch {{ Write-Output $_.Exception.Message }}
     """
-    powershell = str(Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe")
+    powershell = os.environ.get("LIVECLIP_TEST_POWERSHELL") or str(Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe")
     for mode in ("success", "hash", "restart", "outside"):
         target.write_bytes(b"old exe")
         staged.write_bytes(b"new exe" if mode != "hash" else b"corrupted exe")
