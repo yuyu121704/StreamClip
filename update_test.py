@@ -218,6 +218,7 @@ def run():
     assert updates.version_key("2026.09.19") == updates.version_key("2026.09.19.0")
     for bad in ("", "latest", "2026.9", "v2026.09.19-beta", "2026.09.19.2.1", "../../2.0.0"):
         rejected(lambda: updates.version_key(bad))
+    assert updates.LOCAL_HISTORY[0]["date"] == "-".join(updates.VERSION.split(".")[:3])
     assert len(updates.release_history()) >= 4
     rows = updates.parse_releases([release("2026.09.19"), release(), release("2100.1.1", prerelease=True),
                                    release("2101.1.1", draft=True), release("unknown")])
