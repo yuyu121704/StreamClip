@@ -8636,7 +8636,6 @@ class RecorderService:
         self.uploader = BilibiliUploader(lambda: self._cookie_for("publish"))
         self._fast_stop = threading.Event()
         self.ffmpeg = FFmpeg(settings, self._fast_stop)
-        self.transcriber = Transcriber(settings, self.ffmpeg)
         self.replay_downloader = ReplayDownloader(settings, self._fast_stop)
         self.executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="liveclip")
         self._glossary_jobs: set[tuple[str, str, int | None]] = set()
@@ -9759,34 +9758,32 @@ class RecorderService:
                 self.emit("analysis", message, recording_id=recording_id)
 
             self._task_update(task_id, progress=8, message=f"媒体时长 {format_seconds(duration)}")
-            self.transcriber.last_metadata = {}
-            self.transcriber.dashscope.last_audio_types = []
-            self.transcriber.dashscope.last_cloud_metrics = {}
-            self.transcriber.dashscope.last_metadata = {}
+            transcriber = Transcriber(analysis_settings, self.ffmpeg)
+            metadata: dict[str, Any] = {}
             transcription_error = ""
             asr_audio_path = path.with_suffix(".asr.wav")
             vad_map: dict[str, Any] = {}
             vad_timeline: list[dict[str, float]] = []
             try:
                 reuse_transcript = bool(task_payload.get("reuse_transcript"))
-                provider = self.settings.transcription_provider.strip().lower() or "dashscope"
+                provider = analysis_settings.transcription_provider.strip().lower() or "dashscope"
                 timeline_signature = asr_timeline_signature(path)
                 if reuse_transcript:
                     saved = load_verified_transcript(path, recording_transcript_path(record))
                     segments = saved.get("segments") or []
                     if not segments:
                         raise RuntimeError("没有可复用的转写，请先重新识别语音")
-                    self.transcriber.last_metadata = dict(saved.get("asr_metadata") or {})
+                    metadata = dict(saved.get("asr_metadata") or {})
                     analysis_progress("复用已有转写，更新弹幕、回顾与选题…")
                 elif provider in {"none", "关闭"}:
                     segments = []
                 else:
-                    if provider in {"dashscope", "aliyun", "阿里云", "云端"} and not self.transcriber.dashscope._api_key():
+                    if provider in {"dashscope", "aliyun", "阿里云", "云端"} and not transcriber.dashscope._api_key():
                         raise RuntimeError("未配置 DashScope API Key（请在设置中填写，或设置 DASHSCOPE_API_KEY）")
                     self.emit("analysis", "提取 16kHz 单声道 ASR 音频…", recording_id=recording_id)
                     self.ffmpeg.extract_audio(path, asr_audio_path)
                     asr_duration = duration
-                    if bool(getattr(self.settings, "vad_enabled", False)):
+                    if bool(getattr(analysis_settings, "vad_enabled", False)):
                         try:
                             self.emit("analysis", "执行独立静音 VAD…", recording_id=recording_id)
                             vad_map = self.ffmpeg.detect_silence(asr_audio_path, duration)
@@ -9794,7 +9791,7 @@ class RecorderService:
                             temporary_vad = vad_path.with_suffix(vad_path.suffix + ".partial")
                             temporary_vad.write_text(json.dumps(vad_map, ensure_ascii=False, indent=2), encoding="utf-8")
                             os.replace(temporary_vad, vad_path)
-                            if bool(getattr(self.settings, "vad_filter_asr", False)) and vad_map.get("speech_intervals"):
+                            if bool(getattr(analysis_settings, "vad_filter_asr", False)) and vad_map.get("speech_intervals"):
                                 filtered_path = path.with_suffix(".vad.asr.wav")
                                 vad_timeline = self.ffmpeg.extract_intervals_audio(asr_audio_path, filtered_path, vad_map["speech_intervals"])
                                 asr_audio_path = filtered_path
@@ -9802,16 +9799,17 @@ class RecorderService:
                         except Exception as exc:
                             vad_map = {"enabled": True, "error": _redact_secret(exc)}
                             self.emit("warning", f"VAD 失败，继续使用原始音频：{_redact_secret(exc)}", recording_id=recording_id)
-                    segments = self.transcriber.transcribe(asr_audio_path, analysis_progress, asr_duration, vocabulary)
+                    segments = transcriber.transcribe(asr_audio_path, analysis_progress, asr_duration, vocabulary)
+                    metadata = dict(transcriber.last_metadata)
                     if vad_timeline:
                         segments = remap_trimmed_segments(segments, vad_timeline, duration)
                 if asr_timeline_signature(path) != timeline_signature:
                     raise RuntimeError("识别期间源录播发生变化，请重新识别语音")
-                self.transcriber.last_metadata["audio_timeline_signature"] = timeline_signature
+                metadata["audio_timeline_signature"] = timeline_signature
             except Exception as exc:
                 if isinstance(exc, TaskCancelled):
                     raise
-                raise RuntimeError("语音识别失败，录播及已有字幕已保留，可重试：" + _redact_secret(exc, self.transcriber.dashscope._api_key())) from exc
+                raise RuntimeError("语音识别失败，录播及已有字幕已保留，可重试：" + _redact_secret(exc, transcriber.dashscope._api_key())) from exc
             for segment in segments:
                 if float(segment.get("end", 0)) <= float(segment.get("start", 0)):
                     segment["end"] = duration
@@ -9822,15 +9820,6 @@ class RecorderService:
             danmaku_events = load_danmaku_sidecar(danmaku_path, duration, str(record.get("started_at") or ""))
             stats, _ = _danmaku_prompt_context(danmaku_events, duration)
             transcript_path = path.with_suffix(".transcript.json")
-            metadata = dict(self.transcriber.last_metadata)
-            if not metadata and self.transcriber.dashscope.last_audio_types:
-                metadata = {
-                    "provider": "dashscope",
-                    "model": normalize_dashscope_model(self.settings.dashscope_model),
-                    "audio_detector": self.transcriber.dashscope.detector.last_engine,
-                    "audio_types": self.transcriber.dashscope.last_audio_types,
-                    "cloud_audio_metrics": self.transcriber.dashscope.last_cloud_metrics,
-                }
             try:
                 source_metadata = json.loads(str(record.get("metadata_json") or "{}"))
             except (TypeError, json.JSONDecodeError):
@@ -9839,9 +9828,9 @@ class RecorderService:
                 for key in ("source_name", "source_liver_uid", "source_stream_id", "live_started_at", "uploader_uid", "imported_at"):
                     if key in source_metadata:
                         metadata.setdefault(key, source_metadata[key])
-            metadata.setdefault("provider", self.settings.transcription_provider.strip().lower() or "dashscope")
+            metadata.setdefault("provider", provider)
             metadata.setdefault("asr_audio_path", str(asr_audio_path) if asr_audio_path.exists() else "")
-            metadata["vad_enabled"] = bool(getattr(self.settings, "vad_enabled", False))
+            metadata["vad_enabled"] = bool(getattr(analysis_settings, "vad_enabled", False))
             metadata["vad_filtered"] = bool(vad_timeline)
             metadata["vad_map_path"] = str(path.with_suffix(".silence_map.json")) if vad_map else ""
             prompt_segments, correction_report = corrected_segments(segments, glossary_entries)

@@ -216,6 +216,46 @@ def assert_asr_timeline_guards() -> None:
     print("ASR cache checks passed: timeline filter, verified reuse, legacy/changed/corrupt invalidation and failure preservation")
 
 
+def assert_concurrent_transcript_metadata() -> None:
+    with tempfile.TemporaryDirectory(prefix="liveclip-concurrent-transcripts-") as folder:
+        root = Path(folder)
+        settings = app.Settings(base_dir=folder, dashscope_api_key="offline-test", auto_slice=False)
+        db = app.Database(root / "app.db")
+        service = app.RecorderService(settings, db, app.queue.Queue())
+        barrier = threading.Barrier(2)
+        sources = {}
+        for speaker in ("alice", "bob"):
+            source = root / f"{speaker}.mp4"
+            source.write_bytes(speaker.encode())
+            rid = db.create_recording("1", speaker, speaker, str(source), app.now_text())
+            db.finish_recording(rid, "complete", str(source), app.now_text(), 10)
+            sources[rid] = source
+
+        def transcribe(asr, audio, *_args):
+            name = audio.name.split(".")[0]
+            asr.last_metadata = {"audio_detector": name, "cloud_audio_metrics": {"duration": len(name)}}
+            barrier.wait(timeout=10)
+            return [{"start": 0.0, "end": 5.0, "text": name, "speaker_id": name}]
+
+        try:
+            with patch.object(app.DashScopeTranscriber, "transcribe", new=transcribe), \
+                    patch.object(service.ffmpeg, "extract_audio"), \
+                    patch.object(app, "analyze_transcript", return_value=("回顾", [])), \
+                    patch.object(service, "_start_glossary_job"):
+                jobs = [service.executor.submit(service._analyze_recording, rid) for rid in sources]
+                for job in jobs:
+                    job.result(timeout=20)
+            for rid, source in sources.items():
+                payload = app.load_verified_transcript(source, source.with_suffix(".transcript.json"))
+                metadata = payload["asr_metadata"]
+                assert payload["segments"][0]["speaker_id"] == source.stem
+                assert metadata["audio_detector"] == source.stem, (source.name, metadata["audio_detector"])
+                assert metadata["cloud_audio_metrics"] == {"duration": len(source.stem)}
+                assert json.loads(db.get_recording(rid)["metadata_json"])["audio_detector"] == source.stem
+        finally:
+            service.executor.shutdown(wait=True)
+
+
 def assert_transcript_timeline_guards() -> None:
     with tempfile.TemporaryDirectory(prefix="liveclip-transcript-timeline-") as folder:
         root = Path(folder)
@@ -244,7 +284,7 @@ def assert_transcript_timeline_guards() -> None:
                         raise AssertionError("unverified transcript reached rendering")
                     render.assert_not_called()
             tid, _ = db.create_task("analysis", f"recording:{rid}", {"recording_id": rid, "reuse_transcript": True})
-            with patch.object(service.transcriber, "transcribe") as transcribe, patch.object(app, "analyze_transcript") as analyze:
+            with patch.object(app.Transcriber, "transcribe") as transcribe, patch.object(app, "analyze_transcript") as analyze:
                 service._analyze_recording(rid, tid)
                 transcribe.assert_not_called()
                 analyze.assert_not_called()
@@ -254,7 +294,7 @@ def assert_transcript_timeline_guards() -> None:
             with patch.object(service.ffmpeg, "extract_audio", side_effect=lambda _source, target: target.write_bytes(b"normalized audio")), \
                     patch.object(service.ffmpeg, "detect_silence", return_value={"speech_intervals": [{"start": 5, "end": 6}]}) as vad, \
                     patch.object(service.ffmpeg, "extract_intervals_audio", return_value=mapping) as trim, \
-                    patch.object(service.transcriber, "transcribe", return_value=legacy["segments"]) as transcribe, \
+                    patch.object(app.Transcriber, "transcribe", return_value=legacy["segments"]) as transcribe, \
                     patch.object(app, "analyze_transcript", return_value=("offline recap", [])), \
                     patch.object(service, "_start_glossary_job"):
                 service._analyze_recording(rid, tid)
@@ -271,7 +311,7 @@ def assert_transcript_timeline_guards() -> None:
             db.finish_recording(no_asr_rid, "complete", str(no_asr_source), app.now_text(), 10)
             settings.transcription_provider = "none"
             with patch.object(service.ffmpeg, "extract_audio") as extract, \
-                    patch.object(service.transcriber, "transcribe") as transcribe, \
+                    patch.object(app.Transcriber, "transcribe") as transcribe, \
                     patch.object(app, "analyze_transcript", return_value=("no speech", [])), \
                     patch.object(service, "_start_glossary_job"):
                 service._analyze_recording(no_asr_rid)
@@ -289,7 +329,7 @@ def assert_transcript_timeline_guards() -> None:
             tid, _ = db.create_task("analysis", f"recording:{rid}", {"recording_id": rid}, force=True)
             with patch.object(service.ffmpeg, "extract_audio"), \
                     patch.object(service.ffmpeg, "detect_silence", return_value={"speech_intervals": []}), \
-                    patch.object(service.transcriber, "transcribe", side_effect=changed_during_asr), \
+                    patch.object(app.Transcriber, "transcribe", side_effect=changed_during_asr), \
                     patch.object(app, "analyze_transcript") as analyze:
                 service._analyze_recording(rid, tid)
                 analyze.assert_not_called()
@@ -2003,7 +2043,7 @@ def assert_hikami_recording_flow() -> None:
             assert "羽啾chu2u今天来了" in prompt and "宇宙猫" in prompt
             return '{"summary":"鱼啾今天来了。[应为：羽啾chu2u]","highlights":[]}'
         try:
-            with patch.object(service.ffmpeg, "extract_audio", side_effect=lambda source, target: target.write_bytes(b"synthetic audio")), patch.object(service.transcriber, "transcribe", side_effect=transcribe), patch.object(app.LLMClient, "chat", side_effect=chat):
+            with patch.object(service.ffmpeg, "extract_audio", side_effect=lambda source, target: target.write_bytes(b"synthetic audio")), patch.object(app.Transcriber, "transcribe", side_effect=transcribe), patch.object(app.LLMClient, "chat", side_effect=chat):
                 service._analyze_recording(record_id)
                 deadline = time.monotonic() + 5
                 while service._glossary_jobs and time.monotonic() < deadline:
@@ -2027,7 +2067,7 @@ def assert_hikami_recording_flow() -> None:
             assert metadata["live_started_at"] == "2026-09-09 20:00:00"
             db.update_recording_analysis(record_id, "", previous["summary"], json.loads(previous["highlights_json"]))
             task_id, _ = db.create_task("analysis", f"recording:{record_id}", {"recording_id": record_id})
-            with patch.object(service.ffmpeg, "extract_audio", side_effect=lambda source, target: target.write_bytes(b"synthetic audio")), patch.object(service.transcriber, "transcribe", side_effect=transcribe), patch.object(app.LLMClient, "chat", side_effect=TimeoutError("synthetic editorial timeout")), patch.object(service, "_auto_slice", side_effect=AssertionError("failed analysis must not render")):
+            with patch.object(service.ffmpeg, "extract_audio", side_effect=lambda source, target: target.write_bytes(b"synthetic audio")), patch.object(app.Transcriber, "transcribe", side_effect=transcribe), patch.object(app.LLMClient, "chat", side_effect=TimeoutError("synthetic editorial timeout")), patch.object(service, "_auto_slice", side_effect=AssertionError("failed analysis must not render")):
                 service._analyze_recording(record_id, task_id)
             failed = db.get_recording(record_id)
             assert db.get_task(task_id)["status"] == "error" and "AI 选题失败" in failed["error"]
@@ -2036,7 +2076,7 @@ def assert_hikami_recording_flow() -> None:
             assert json.loads(Path(failed["transcript_path"]).read_text(encoding="utf-8"))["segments"] == transcripts
             checkpoint = source.with_suffix(".analysis-checkpoint.json")
             assert not checkpoint.exists(), "failed first piece must not be cached"
-            with patch.object(app, "_split_text", return_value=[app._transcript_text([segment]) for segment in transcripts]), patch.object(service.transcriber, "transcribe", side_effect=AssertionError("resume must reuse ASR")), patch.object(service, "_start_glossary_job"):
+            with patch.object(app, "_split_text", return_value=[app._transcript_text([segment]) for segment in transcripts]), patch.object(app.Transcriber, "transcribe", side_effect=AssertionError("resume must reuse ASR")), patch.object(service, "_start_glossary_job"):
                 retry_id, _ = db.create_task("analysis", f"recording:{record_id}", {"recording_id": record_id, "reuse_transcript": True}, force=True)
                 with patch.object(app.LLMClient, "chat", side_effect=['{"summary":"分段一","highlights":[]}', TimeoutError("second piece timeout")]):
                     service._analyze_recording(record_id, retry_id)
@@ -2442,7 +2482,7 @@ def assert_replay_import_workflow() -> None:
                 assert json.loads(analysis["payload_json"])["run_pipeline"] is True
                 candidate = {"start": 0, "end": 50, "title": "测试高光", "cover_text": "测试封面", "source": "llm", "confidence": 0.9}
                 segments = [{"start": 0, "end": 50, "text": "合成转写，用于验证导入后自动进入总结与切片流程。"}]
-                with patch.object(service.ffmpeg, "extract_audio", side_effect=lambda _source, target: target.write_bytes(b"synthetic audio")), patch.object(service.transcriber, "transcribe", return_value=segments), patch.object(app, "analyze_transcript", return_value=("新总结", [candidate])) as summarize, patch.object(service, "_create_clip_sync", return_value=123) as render, patch.object(service, "enqueue_upload", return_value=456) as publish:
+                with patch.object(service.ffmpeg, "extract_audio", side_effect=lambda _source, target: target.write_bytes(b"synthetic audio")), patch.object(app.Transcriber, "transcribe", return_value=segments), patch.object(app, "analyze_transcript", return_value=("新总结", [candidate])) as summarize, patch.object(service, "_create_clip_sync", return_value=123) as render, patch.object(service, "enqueue_upload", return_value=456) as publish:
                     service._analyze_recording(rid, analysis["id"])
                     assert db.get_task(analysis["id"])["status"] == "complete", db.get_task(analysis["id"])
                     assert summarize.call_args.args[4][0]["text"] == "弹幕 & 互动"
@@ -2450,7 +2490,7 @@ def assert_replay_import_workflow() -> None:
                     publish.assert_called_once_with(123, start=True, auto=True)
                 assert db.get_recording(rid)["summary"] == "新总结" and settings.auto_slice is False
                 rerun = service.analyze_recording(rid, force=True, reuse_transcript=True, run_pipeline=True)
-                with patch.object(service.transcriber, "transcribe", side_effect=AssertionError("must reuse transcript")), patch.object(app, "analyze_transcript", return_value=("重做总结", [])) as summarize:
+                with patch.object(app.Transcriber, "transcribe", side_effect=AssertionError("must reuse transcript")), patch.object(app, "analyze_transcript", return_value=("重做总结", [])) as summarize:
                     service._analyze_recording(rid, rerun)
                     summarize.assert_called_once()
                 assert db.get_task(rerun)["status"] == "complete" and db.get_recording(rid)["summary"] == "重做总结"
@@ -4693,6 +4733,7 @@ if __name__ == "__main__":
     assert_llm_transient_recovery()
     assert_media_resource_limits()
     assert_asr_timeline_guards()
+    assert_concurrent_transcript_metadata()
     assert_transcript_timeline_guards()
     assert_media_failure_guards()
     assert_recording_stop_guards()

@@ -173,7 +173,7 @@ def run() -> None:
             rid = db.create_recording("1", "check", "回归录播", str(source), started, source_type="local", source_id="check-source")
             db.finish_recording(rid, "complete", str(source), app.now_text(), 90)
             task_id, _ = db.create_task("analysis", "asr-failure", {"recording_id": rid})
-            with patch.object(service.ffmpeg, "extract_audio"), patch.object(service.transcriber, "transcribe", side_effect=RuntimeError("test ASR failure")), patch.object(service, "_auto_slice") as slices:
+            with patch.object(service.ffmpeg, "extract_audio"), patch.object(app.Transcriber, "transcribe", side_effect=RuntimeError("test ASR failure")), patch.object(service, "_auto_slice") as slices:
                 service._analyze_recording(rid, task_id)
                 slices.assert_not_called()
             assert db.get_task(task_id)["status"] == "error"
