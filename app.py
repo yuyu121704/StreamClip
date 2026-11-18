@@ -9920,7 +9920,8 @@ class RecorderService:
             self._task_update(task_id, progress=88, message=f"回顾完成，发现 {len(highlights)} 个高光候选")
             recap_path = path.with_suffix(".recap.md")
             try:
-                write_text_atomic(recap_path, correct_recap(build_markdown_recap(str(record.get("title") or path.stem), duration, summary, highlights, segments, danmaku_events, metadata), glossary_entries))
+                recap_title = correct_recap(str(record.get("title") or path.stem), glossary_entries)
+                write_text_atomic(recap_path, build_markdown_recap(recap_title, duration, summary, highlights, segments, danmaku_events, metadata))
                 self.db.set_recording_recap_path(recording_id, str(recap_path))
             except OSError as exc:
                 self.emit("warning", f"Markdown 回顾保存失败，继续保留数据库总结：{exc}", recording_id=recording_id)

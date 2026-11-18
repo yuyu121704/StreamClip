@@ -1746,6 +1746,12 @@ def assert_hikami_glossary_workflow() -> None:
         assert report["applied_terms"] == ["鱼啾"] and report["changed_segments"] == 1
         rules = [("AI", "人工智能"), ("鱼啾们", "粉丝们"), ("鱼啾", "羽啾")]
         assert hg.correct_text("MAIL AI 鱼啾们 鱼啾", rules)[0] == "MAIL 人工智能 粉丝们 羽啾"
+        for canonical in ("小岁岁", "主播小岁", "主播小岁同学"):
+            rules = [("小岁", canonical)]
+            expected = f"{canonical}和{canonical}"
+            assert hg.correct_text(f"小岁和{canonical}", rules) == (expected, ["小岁"])
+            assert hg.correct_text(expected, rules) == (expected, [])
+        assert hg.correct_text("甲和乙", [("甲", "乙"), ("乙", "丙")]) == ("乙和丙", ["乙", "甲"])
         content = '> 鱼啾原话\n▶ 鱼啾弹幕\n鱼啾说“鱼啾”与「鱼啾」及"鱼啾"。\n'
         assert hg.correct_recap(content, entries) == '> 鱼啾原话\n▶ 鱼啾弹幕\n羽啾chu2u说“鱼啾”与「鱼啾」及"鱼啾"。\n'
         marked = '> 鱼啾[应为： 羽啾chu2u ]\n鱼啾[应为:羽啾chu2u]和粉丝[应为：宇宙猫][应为： ]'
@@ -2020,20 +2026,21 @@ def assert_hikami_search_transport() -> None:
 def assert_hikami_recording_flow() -> None:
     with tempfile.TemporaryDirectory(prefix="liveclip-hikami-flow-") as folder:
         root = Path(folder)
-        source = root / "sample.wav"
+        source = root / "鱼啾.wav"
         source.write_bytes(b"synthetic test source")
         settings = app.Settings(base_dir=str(root), dashscope_api_key="asr-test", llm_model="offline-test", auto_slice=False)
         db = app.Database(root / "app.db")
         db.glossary.save_channel("2138961136", "羽啾chu2u", "1727074031")
         db.glossary.upsert("2138961136", "鱼啾", "羽啾chu2u", "人名")
+        db.glossary.upsert("2138961136", "小岁", "小岁岁", "人名")
         db.glossary.set_note("2138961136", "粉丝勋章：宇宙猫（测试资料）。")
-        record_id = db.create_recording("1727074031", "offline", "合成测试录播", str(source), app.now_text(), metadata={"source_name": "羽啾chu2u", "source_liver_uid": "2138961136", "live_started_at": "2026-09-09 20:00:00"})
+        record_id = db.create_recording("1727074031", "offline", "鱼啾的合成测试录播", str(source), app.now_text(), metadata={"source_name": "羽啾chu2u", "source_liver_uid": "2138961136", "live_started_at": "2026-09-09 20:00:00"})
         db.finish_recording(record_id, "recorded", str(source), app.now_text(), 20)
         service = app.RecorderService(settings, db, app.queue.Queue())
         transcripts = [{"start": 0.0, "end": 8.0, "text": "鱼啾今天来了。", "speaker_id": "0"}, {"start": 8.0, "end": 20.0, "text": "这是合成的测试转写。"}]
         captured = []
         def transcribe(path, progress, duration, vocabulary=None):
-            assert vocabulary == {"羽啾chu2u": 4}
+            assert vocabulary == {"羽啾chu2u": 4, "小岁岁": 4}
             return [dict(item) for item in transcripts]
         def chat(prompt, system=""):
             captured.append((prompt, system))
@@ -2041,7 +2048,7 @@ def assert_hikami_recording_flow() -> None:
                 assert "鱼啾今天来了" in prompt
                 return '{"items":[{"term":"测试新词","canonical":"测试新词","category":"梗","confidence":0.8,"occurrence_count":2,"reason":"合成候选"}]}'
             assert "羽啾chu2u今天来了" in prompt and "宇宙猫" in prompt
-            return '{"summary":"鱼啾今天来了。[应为：羽啾chu2u]","highlights":[]}'
+            return '{"summary":"鱼啾今天来了。小岁提到小岁岁。[应为：羽啾chu2u]","highlights":[]}'
         try:
             with patch.object(service.ffmpeg, "extract_audio", side_effect=lambda source, target: target.write_bytes(b"synthetic audio")), patch.object(app.Transcriber, "transcribe", side_effect=transcribe), patch.object(app.LLMClient, "chat", side_effect=chat):
                 service._analyze_recording(record_id)
@@ -2055,7 +2062,11 @@ def assert_hikami_recording_flow() -> None:
             assert "羽啾chu2u" in source.with_suffix(".transcript.corrected.txt").read_text(encoding="utf-8")
             assert "羽啾chu2u" in db.get_recording(record_id)["summary"]
             assert "[应为" not in db.get_recording(record_id)["summary"]
-            assert "[应为" not in source.with_suffix(".recap.md").read_text(encoding="utf-8")
+            recap = source.with_suffix(".recap.md").read_text(encoding="utf-8")
+            assert "[应为" not in recap and "小岁岁提到小岁岁。" in db.get_recording(record_id)["summary"]
+            assert db.get_recording(record_id)["summary"] in recap
+            assert recap.startswith("# 羽啾chu2u的合成测试录播") and "说话人 0：鱼啾今天来了。" in recap
+            assert str(source.with_suffix(".publish.json")) in recap
             assert json.loads(source.with_suffix(".suggested_terms.json").read_text(encoding="utf-8")) == ["羽啾chu2u"]
             assert db.glossary.candidates("2138961136")[0]["status"] == "pending"
             assert "测试新词" not in app.asr_vocabulary(db.glossary.entries("2138961136", merged=True))

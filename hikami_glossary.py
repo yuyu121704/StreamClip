@@ -18,6 +18,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime
+from functools import lru_cache
 from html.parser import HTMLParser
 from typing import Any, Callable
 
@@ -426,15 +427,33 @@ def correction_rules(entries: list[dict]) -> list[tuple[str, str]]:
     return sorted(((item["term"].strip(), item["canonical"].strip()) for item in entries if item["enabled"] and item["term"].strip() and item["canonical"].strip() and item["term"].strip() != item["canonical"].strip()), key=lambda pair: len(pair[0]), reverse=True)
 
 
+@lru_cache(maxsize=8)
+def _correction_matcher(rules: tuple[tuple[str, str], ...]) -> tuple[re.Pattern[str], dict[str, str]]:
+    replacements = dict(rules)
+    alternatives = []
+    # Consume whole canonical names too, so an alias inside one cannot expand it again.
+    for name in sorted(replacements.keys() | set(replacements.values()), key=len, reverse=True):
+        literal = re.escape(name)
+        if name in replacements and re.search(r"[A-Za-z0-9]", name):
+            literal = r"(?<![A-Za-z0-9])" + literal + r"(?![A-Za-z0-9])"
+        alternatives.append(literal)
+    return re.compile("|".join(alternatives)), replacements
+
+
 def correct_text(text: str, rules: list[tuple[str, str]]) -> tuple[str, list[str]]:
-    applied = []
-    for term, canonical in rules:
-        # Keep upstream semantics: ASCII word boundaries; CJK terms use literal substring replacement.
-        result = re.sub(r"(?<![A-Za-z0-9])" + re.escape(term) + r"(?![A-Za-z0-9])", lambda _match: canonical, text) if re.search(r"[A-Za-z0-9]", term) else text.replace(term, canonical)
-        if result != text:
-            applied.append(term)
-            text = result
-    return text, sorted(set(applied))
+    if not rules:
+        return text, []
+    pattern, replacements = _correction_matcher(tuple(rules))
+    applied = set()
+
+    def replace(match: re.Match[str]) -> str:
+        term = match[0]
+        canonical = replacements.get(term, term)
+        if canonical != term:
+            applied.add(term)
+        return canonical
+
+    return pattern.sub(replace, text), sorted(applied)
 
 
 def corrected_segments(segments: list[dict], entries: list[dict]) -> tuple[list[dict], dict]:
