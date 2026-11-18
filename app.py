@@ -9004,8 +9004,12 @@ class RecorderService:
 
             files = files_for(record)
             protected = set()
-            # Linear scan of recorded file references; move to a file index if the library grows large.
-            for other in conn.execute("SELECT * FROM recordings WHERE id<>? AND deleted=0", (recording_id,)):
+            # A repeated source can still have different explicit sidecars. Deduplicate
+            # only identical inputs to files_for before expanding the filesystem paths.
+            for other in conn.execute(
+                """SELECT DISTINCT path,source_type,transcript_path,danmaku_path,recap_path,publish_package_path
+                   FROM recordings WHERE id<>? AND deleted=0""", (recording_id,),
+            ):
                 protected.update(files_for(dict(other)))
             for clip in conn.execute("SELECT path,thumbnail_path FROM clips"):
                 for value in clip:

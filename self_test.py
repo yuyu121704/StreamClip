@@ -2253,6 +2253,14 @@ def assert_recording_deletion() -> None:
             with patch.object(service.ffmpeg, "duration", return_value=30):
                 assert service._register_media(source, "重新导入", "live", "", "delete-test") == rid
             assert not db.get_recording(rid)["deleted"] and len(db.list_recordings()) == 2
+            another = db.create_recording("123", "shared-again", "共用视频但旁文件不同", str(other), app.now_text())
+            danmaku = base.with_suffix(".danmaku.jsonl")
+            danmaku.write_bytes(b"shared comments")
+            for owner, sibling in ((shared, another), (another, shared)):
+                db.set_recording_danmaku_path(owner, danmaku.name)
+                db.set_recording_danmaku_path(sibling, "separate.danmaku.jsonl")
+                blocked("其他录播或切片")
+                assert danmaku.read_bytes() == b"shared comments"
         finally:
             service.executor.shutdown(wait=True)
     print("Recording deletion checks passed: files, retries, busy/shared guards, clip/upload retention and reimport")
