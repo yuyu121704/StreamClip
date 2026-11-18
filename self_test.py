@@ -531,10 +531,13 @@ def assert_fast_recording_exit() -> None:
                 raise AssertionError("tool check swallowed exit cancellation")
             execute.assert_called_once()
         db = app.Database(Path(folder) / "app.db")
-        db.add_room("1", "Fast exit")
+        rooms = {str(index) for index in range(1, 6)}
+        for room_id in rooms:
+            db.add_room(room_id, f"Fast exit {room_id}")
         service = app.RecorderService(settings, db, app.queue.Queue())
         actual_popen = subprocess.Popen
         spawned = []
+        release_jobs = threading.Event()
 
         def capture(args, **kwargs):
             process = actual_popen(
@@ -553,25 +556,34 @@ def assert_fast_recording_exit() -> None:
                     patch.object(app.BilibiliClient, "stream_urls", return_value=["https://example.invalid/live"]), \
                     patch.object(app.subprocess, "Popen", side_effect=capture), \
                     patch.object(service.ffmpeg, "merge_recording_parts") as merge:
+                background = [service.executor.submit(release_jobs.wait) for _ in range(4)]
+                service.check_now()
                 service.start_recording("1")
                 deadline = time.monotonic() + 5
-                while not list(settings.recordings_path.glob("*.part*.ts")):
-                    assert time.monotonic() < deadline, "recording child did not write a segment"
+                while len(list(settings.recordings_path.glob("*.part*.ts"))) < len(rooms):
+                    assert time.monotonic() < deadline, "busy task workers delayed live capture"
                     time.sleep(0.01)
+                assert all(job.running() for job in background)
+                release_jobs.set()
+                assert service.executor.submit(lambda: True).result(timeout=3), "recordings blocked other work"
                 started = time.monotonic()
                 service.stop(fast=True)
                 assert time.monotonic() - started < 2.5, "exit waited for validation"
                 merge.assert_not_called()
-            record = db.list_recordings()[0]
-            assert record["status"] == "error" and "尚未合并或校验" in record["error"]
-            assert Path(record["path"]).read_bytes() == b"raw segment"
-            assert spawned and all(process.poll() is not None for process in spawned)
+            records = db.list_recordings()
+            assert len(spawned) == len(records) == len(rooms) and {record["room_id"] for record in records} == rooms
+            for record in records:
+                assert record["status"] == "error" and "尚未合并或校验" in record["error"]
+                assert Path(record["path"]).read_bytes() == b"raw segment"
+            assert all(process.poll() is not None for process in spawned)
         finally:
+            release_jobs.set()
+            service.stop(fast=True)
             for process in spawned:
                 if process.poll() is None:
                     process.kill()
                 process.wait(timeout=5)
-            service.executor.shutdown(wait=True, cancel_futures=True)
+            service.stop()
 
         db = app.Database(Path(folder) / "blocked.db")
         db.add_room("2", "Blocked URL")
@@ -594,12 +606,27 @@ def assert_fast_recording_exit() -> None:
                 assert not service.stop(fast=True), "blocked network worker should remain pending"
                 assert time.monotonic() - started < 2.5
                 assert db.list_recordings()[0]["status"] == "error"
-                release.set()
-                service.executor.shutdown(wait=True)
+                # A second close can race a worker that already committed its output.
+                record = db.list_recordings()[0]
+                verified = Path(folder) / "verified.mp4"
+                verified.write_bytes(b"completed output")
+                db.finish_recording(record["id"], "complete", str(verified), app.now_text(), 10)
+                assert not service.stop(fast=True)
+                latest = db.get_recording(record["id"])
+                assert (latest["status"], latest["path"], latest["duration"]) == ("complete", str(verified), 10)
+                stopped = threading.Event()
+                closer = threading.Thread(target=lambda: (service.stop(), stopped.set()))
+                closer.start()
+                try:
+                    assert not stopped.wait(0.15), "graceful shutdown did not wait for a recording worker"
+                finally:
+                    release.set()
+                    closer.join(timeout=3)
+                assert stopped.is_set() and not service.active_room_ids()
                 launch.assert_not_called()
         finally:
             release.set()
-            service.executor.shutdown(wait=True)
+            service.stop()
 
         service = app.RecorderService(settings, db, app.queue.Queue())
         exited = threading.Event()

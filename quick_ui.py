@@ -1187,8 +1187,9 @@ def run():
             bridge._network.shutdown(wait=True, cancel_futures=True)
         engine.deleteLater()
         logging.shutdown()
-        if bridge._closing and any(thread.is_alive() for executor in (bridge.service.executor, bridge._pool, bridge._network)
-                                   for thread in executor._threads):
+        if bridge._closing and (bridge.service.active_room_ids() or
+                                any(thread.is_alive() for executor in (bridge.service.executor, bridge._pool, bridge._network)
+                                    for thread in executor._threads)):
             # After recorder data and managed children are settled, stalled
             # network threads must not keep the windowed process invisible.
             os._exit(0)

@@ -36,7 +36,7 @@ import wave
 import xml.etree.ElementTree as ET
 import zlib
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime, timezone, timedelta
@@ -2260,11 +2260,14 @@ class Database:
         ended_at: str,
         duration: float,
         error: str = "",
+        *,
+        active_only: bool = False,
     ) -> None:
         with self._connect() as conn:
             conn.execute(
-                """UPDATE recordings SET status=?,path=?,ended_at=?,duration=?,error=?,deleted=0 WHERE id=?""",
-                (status, path, ended_at, max(0, duration), error, recording_id),
+                """UPDATE recordings SET status=?,path=?,ended_at=?,duration=?,error=?,deleted=0
+                   WHERE id=? AND (NOT ? OR (deleted=0 AND status IN ('starting','recording','stopping')))""",
+                (status, path, ended_at, max(0, duration), error, recording_id, active_only),
             )
 
     def get_recording(self, recording_id: int) -> dict[str, Any] | None:
@@ -8722,9 +8725,8 @@ class RecorderService:
 
     def start(self) -> None:
         with self._active_lock:
-            if self._fast_stop.is_set() or (self.monitor_thread and self.monitor_thread.is_alive()):
+            if self.stop_event.is_set() or (self.monitor_thread and self.monitor_thread.is_alive()):
                 return
-            self.stop_event.clear()
         self._resume_persisted_tasks()
         with self._active_lock:
             if self.stop_event.is_set() or self._fast_stop.is_set() or (self.monitor_thread and self.monitor_thread.is_alive()):
@@ -8739,6 +8741,7 @@ class RecorderService:
             if fast:
                 self._fast_stop.set()
             states = list(self._active.values())
+        recordings = [state["future"] for state in states if "future" in state]
         if getattr(self, "_qr_cancel", None):
             self._qr_cancel.set()
         for state in states:
@@ -8766,16 +8769,17 @@ class RecorderService:
                             saved = parts[0] if parts else None
                             self.db.finish_recording(recording_id, "error", str(saved or source), now_text(), 0,
                                                      "快速退出：录播分段已保留，尚未合并或校验。" if saved else
-                                                     "快速退出：尚无可保留录播分段。")
+                                                     "快速退出：尚无可保留录播分段。", active_only=True)
                     except Exception:
                         logging.exception("录制退出时收尾失败")
                         raise
             self.ffmpeg.cancel()
             self.replay_downloader.cancel()
             self.executor.shutdown(wait=False, cancel_futures=True)
-            return all(not thread.is_alive() for thread in self.executor._threads)
+            return all(recording.done() for recording in recordings) and all(not thread.is_alive() for thread in self.executor._threads)
         if self.monitor_thread and self.monitor_thread.is_alive():
             self.monitor_thread.join()
+        wait(recordings)
         self.executor.shutdown(wait=True, cancel_futures=True)
         return True
 
@@ -9318,19 +9322,25 @@ class RecorderService:
                 return
             self._recovery.pop(room_id, None)
             state: dict[str, Any] = {"stop": threading.Event(), "process": None, "recording_id": None, "danmaku_collector": None, "manual_stop": False}
+            # One capture thread per live room. Closing submissions immediately retires
+            # its thread when capture finishes; stop() still waits on the same future.
+            capture = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"liveclip-record-{room_id}")
+            try:
+                state["future"] = capture.submit(self._record_worker, room_id, state)
+            finally:
+                capture.shutdown(wait=False)
             self._active[room_id] = state
-            state["future"] = self.executor.submit(self._record_worker, room_id, state)
         self.emit("info", f"准备录制房间 {room_id}…", room_id=room_id)
 
     def stop_recording(self, room_id: str) -> None:
         with self._active_lock:
             state = self._active.get(room_id)
-        if not state:
-            return
-        state["manual_stop"] = True
-        if state["stop"].is_set():
-            return
-        state["stop"].set()
+            if not state:
+                return
+            state["manual_stop"] = True
+            if state["stop"].is_set():
+                return
+            state["stop"].set()
         self.emit("info", f"正在停止房间 {room_id} 的录制…", room_id=room_id)
 
     @staticmethod
@@ -9406,7 +9416,7 @@ class RecorderService:
             room_account_id = int(room_config.get("account_id") or 0)
             room_client = BilibiliClient(lambda: self._cookie_for("download", room_account_id))
             info = room_client.room_info(room_id)
-            if not info["live_status"] or self._fast_stop.is_set():
+            if not info["live_status"] or state["stop"].is_set() or self.stop_event.is_set():
                 return
             started_at = now_text()
             started_wall = time.time()
@@ -9522,7 +9532,7 @@ class RecorderService:
                 ffmpeg_log.flush()
                 try:
                     with self._active_lock:
-                        if self._fast_stop.is_set():
+                        if state["stop"].is_set() or self.stop_event.is_set():
                             break
                         process = subprocess.Popen(ffmpeg_args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=ffmpeg_log, bufsize=0, creationflags=creationflags)
                         state["process"] = process
