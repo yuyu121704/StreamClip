@@ -125,6 +125,23 @@ def check_private_visual_review() -> None:
             with patch.object(service, "_cookie_for", return_value="offline"), patch.object(app.BilibiliUploader, "upload", return_value="BV-public") as uploader, patch.object(service, "_refresh_upload_receipt"):
                 service._upload_worker(normal_uid, db.get_upload(normal_uid)["task_id"])
             assert uploader.call_args.args[-2] == "public"
+
+            # The same clean clip sent by automation must stay private under a public default.
+            auto_uid = service.enqueue_upload(normal, start=False, auto=True, account_id=2)
+            auto_task = db.get_upload(auto_uid)["task_id"]
+            assert json.loads(db.get_upload(auto_uid)["metadata_json"])["visibility"] == "self"
+
+            # A legacy pending task can carry its automatic origin only in the task payload.
+            db.set_upload_metadata(auto_uid, {"visibility": "public"})
+            db.update_task(auto_task, status="error")
+            with patch.object(service, "_schedule_task", side_effect=lambda task, work: scheduled.append((task, work))):
+                service.retry_upload(auto_uid)
+            with patch.object(service, "_cookie_for", return_value="offline"), patch.object(app.BilibiliUploader, "upload", return_value="BV-automatic") as uploader, patch.object(app.BilibiliUploader, "find_receipt", return_value={"bvid": "BV-automatic", "state": -50}):
+                scheduled[-1][1]()
+            assert uploader.call_args.args[-2] == "self" and app.bilibili_visibility_flag(uploader.call_args.args[-2]) == 1
+            auto_row = db.get_upload(auto_uid)
+            assert auto_row["status"] == "success" and json.loads(auto_row["metadata_json"])["auto"]
+            assert settings.publish_visibility == "public"
         finally:
             service.executor.shutdown(wait=True)
     print("Private review passed: render, fallback frame, forced private queue/retry, durable warning, receipt and normal public posts")

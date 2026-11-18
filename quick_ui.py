@@ -583,7 +583,7 @@ class Bridge(QObject):
             detail = {"id": clip["id"], "canDelete": clip["status"] != "processing", "title": clip["title"], "path": clip["path"], "video": local_url(clip["path"]) if Path(clip["path"]).is_file() else "",
                       "cover": local_url(clip.get("thumbnail_path")) if clip.get("thumbnail_path") and Path(clip["thumbnail_path"]).is_file() else "",
                       "candidates": local_url(Path(clip["path"]).with_suffix(".cover-candidates.jpg")) if Path(clip["path"]).with_suffix(".cover-candidates.jpg").is_file() else "",
-                      "info": f"{core.format_seconds(clip['start_time'])} — {core.format_seconds(clip['end_time'])} · {core.STATUS_LABELS.get(state, state)}\n投稿可见性：{core.PUBLISH_VISIBILITIES[visibility]}\n" + (warning or "、".join(core.REVIEW_FLAG_LABELS.get(f, f) for f in flags) or "未发现阻断项"), "evidence": evidence or "暂无选题依据。"}
+                      "info": f"{core.format_seconds(clip['start_time'])} — {core.format_seconds(clip['end_time'])} · {core.STATUS_LABELS.get(state, state)}\n自动投稿：仅自己可见 · 手动投稿可见性：{core.PUBLISH_VISIBILITIES[visibility]}\n" + (warning or "、".join(core.REVIEW_FLAG_LABELS.get(f, f) for f in flags) or "未发现阻断项"), "evidence": evidence or "暂无选题依据。"}
         glossary = None
         if self._glossary_open:
             store = self.db.glossary

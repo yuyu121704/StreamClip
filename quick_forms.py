@@ -17,7 +17,7 @@ def field(key, label, kind="text", choices=None):
 SETTINGS_FIELDS = [
     [field("recordings_dir", "录播保存目录", "folder"), field("clips_dir", "切片保存目录", "folder"),
      field("auto_slice", "录播结束后自动转写、总结、切片并投稿", "bool"),
-     field("publish_visibility", "投稿可见性", "choice", core.PUBLISH_VISIBILITIES)],
+     field("publish_visibility", "手动投稿可见性", "choice", core.PUBLISH_VISIBILITIES)],
     [field("render_font_name", "字体方案 / 字体名称"), field("render_font_path", "导入字体文件", "font"),
      field("subtitle_burn_enabled", "将字幕压入视频画面", "bool"),
      field("subtitle_font_size", "字幕字号（12～240）", "int"), field("subtitle_color", "字幕文字颜色", "color"),

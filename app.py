@@ -2437,8 +2437,10 @@ class Database:
             row = conn.execute(
                 """SELECT uploads.*, clips.path AS clip_path, clips.title AS clip_title,
                           clips.recording_id, clips.start_time, clips.end_time,
-                          clips.review_status, clips.review_flags, clips.metadata_json AS clip_metadata
+                          clips.review_status, clips.review_flags, clips.metadata_json AS clip_metadata,
+                          CASE WHEN json_valid(tasks.payload_json) THEN json_extract(tasks.payload_json, '$.auto') END AS task_auto
                    FROM uploads JOIN clips ON clips.id=uploads.clip_id
+                   LEFT JOIN tasks ON tasks.id=uploads.task_id
                    WHERE uploads.id=?""",
                 (upload_id,),
             ).fetchone()
@@ -10426,7 +10428,7 @@ class RecorderService:
             "review_flags": review_flags,
             "review_override": review_override,
             "auto": bool(auto),
-            "visibility": "self" if warning else normalize_publish_visibility(getattr(self.settings, "publish_visibility", "self")),
+            "visibility": "self" if auto or warning else normalize_publish_visibility(getattr(self.settings, "publish_visibility", "self")),
             "review_warning": warning,
             "package_version": PUBLISH_PACKAGE_VERSION,
         }
@@ -10469,15 +10471,10 @@ class RecorderService:
             if self._task_cancelled(task_id):
                 raise TaskCancelled("投稿任务已取消")
             review_status, review_flags, review_metadata = self.db.clip_review(int(upload.get("clip_id") or 0))
-            upload_metadata_raw = upload.get("metadata_json")
-            try:
-                upload_metadata = json.loads(str(upload_metadata_raw or "{}"))
-            except (TypeError, json.JSONDecodeError):
-                upload_metadata = {}
-            if isinstance(upload_metadata, dict):
-                queued_flags = upload_metadata.get("review_flags")
-                if isinstance(queued_flags, list):
-                    review_flags = list(dict.fromkeys(review_flags + [str(value) for value in queued_flags if str(value).strip()]))
+            upload_metadata = persisted_metadata
+            queued_flags = upload_metadata.get("review_flags")
+            if isinstance(queued_flags, list):
+                review_flags = list(dict.fromkeys(review_flags + [str(value) for value in queued_flags if str(value).strip()]))
             upload_candidate = dict(review_metadata)
             upload_candidate["title"] = str(upload.get("title") or "")
             upload_candidate["reason"] = str(upload.get("description") or "")
@@ -10502,11 +10499,12 @@ class RecorderService:
                 upload_metadata.get("visibility") if isinstance(upload_metadata, dict) else "",
                 getattr(self.settings, "publish_visibility", "self"),
             )
-            if warning:
+            automatic = bool(upload_metadata.get("auto") or upload.get("task_auto"))
+            if automatic or warning:
                 visibility = "self"
-                upload_metadata.update(visibility="self", review_warning=warning)
+                upload_metadata.update(visibility=visibility, auto=automatic, review_warning=warning)
                 self.db.set_upload_metadata(upload_id, upload_metadata)
-                self._task_update(task_id, message="正在私密投稿；" + warning)
+                self._task_update(task_id, message="正在私密投稿" + ("；" + warning if warning else ""))
             account_cookie = self._cookie_for("publish", int(upload.get("account_id") or 0))
             uploader = BilibiliUploader(lambda: account_cookie)
             self._wait_publish_slot(task_id)
@@ -10574,7 +10572,7 @@ class RecorderService:
                 self._task_update(task_id, status="waiting", progress=95, message=str(archive.get("state_desc") or "平台正在转码或审核"))
                 return
             actual_private = state == -50 or int(archive.get("is_only_self") or 0) == 1
-            expected_private = normalize_publish_visibility(metadata.get("visibility"), self.settings.publish_visibility) == "self"
+            expected_private = bool(metadata.get("auto") or upload.get("task_auto")) or normalize_publish_visibility(metadata.get("visibility"), self.settings.publish_visibility) == "self"
             if actual_private != expected_private:
                 message = "平台可见性与投稿设置不一致，请到创作中心检查"
                 self.db.update_upload(upload_id, "visibility_mismatch", message, bvid=bvid)
@@ -10598,7 +10596,7 @@ class RecorderService:
         upload = self.db.get_upload(upload_id)
         if not upload:
             return
-        task_id, _ = self.db.create_task("upload", f"upload:{upload_id}", {"upload_id": int(upload_id)}, force=True)
+        task_id, _ = self.db.create_task("upload", f"upload:{upload_id}", {"upload_id": int(upload_id), "auto": bool(upload.get("task_auto"))}, force=True)
         self.db.set_upload_task(upload_id, task_id)
         self._schedule_task(task_id, lambda: self._upload_worker(upload_id, task_id))
 
@@ -10757,7 +10755,7 @@ class DesktopApp:
         self.character_art.pack(fill=X, pady=(0, 12))
         intro = self.character_art.intro
         ttk.Label(intro, text="切片工作台", style="DashboardTitle.TLabel").pack(anchor="w")
-        self.dashboard_hint_var = StringVar(value="录播结束后，自动处理会完成 AI 回顾、选片并按可见性加入投稿队列。")
+        self.dashboard_hint_var = StringVar(value="录播结束后，自动处理会完成 AI 回顾、选片，并按仅自己可见投稿。")
         hint = ttk.Label(intro, textvariable=self.dashboard_hint_var, style="Muted.TLabel", wraplength=520, justify="left")
         hint.pack(fill=X, pady=(6, 0))
         intro.bind("<Configure>", lambda event: hint.configure(wraplength=max(200, event.width)), add="+")
@@ -11236,7 +11234,7 @@ class DesktopApp:
         add_check("basic", "录播结束后自动转写、总结、生成高光切片并投稿", self.auto_slice_var)
         tab = page_body("basic")
         row = rows["basic"]
-        ttk.Label(tab, text="投稿可见性").grid(row=row, column=0, sticky="w", pady=5)
+        ttk.Label(tab, text="手动投稿可见性").grid(row=row, column=0, sticky="w", pady=5)
         self.publish_visibility_var = StringVar(value=PUBLISH_VISIBILITIES.get(self.settings.publish_visibility, PUBLISH_VISIBILITIES["self"]))
         ttk.Combobox(tab, textvariable=self.publish_visibility_var, values=list(PUBLISH_VISIBILITIES.values()), state="readonly", width=26).grid(row=row, column=1, sticky="w", padx=(14, 6), pady=5)
         rows["basic"] += 1
@@ -12607,7 +12605,7 @@ class DesktopApp:
             warning = visual_review_warning(metadata)
             visibility = PUBLISH_VISIBILITIES["self" if warning else self.settings.publish_visibility]
             tips = warning or "、".join(REVIEW_FLAG_LABELS.get(flag, flag) for flag in flags) or "未发现阻断项"
-            self.clip_preview_info.set(f"{format_seconds(clip.get('start_time'))} — {format_seconds(clip.get('end_time'))}  ·  {STATUS_LABELS.get(status, status)}\n投稿可见性：{visibility}\n{tips}")
+            self.clip_preview_info.set(f"{format_seconds(clip.get('start_time'))} — {format_seconds(clip.get('end_time'))}  ·  {STATUS_LABELS.get(status, status)}\n自动投稿：仅自己可见 · 手动投稿可见性：{visibility}\n{tips}")
             self._clip_preview_source = None
             cover = Path(str(clip.get("thumbnail_path") or ""))
             if cover.is_file():
