@@ -135,6 +135,10 @@ def check_private_visual_review() -> None:
             db.set_upload_metadata(auto_uid, {"visibility": "public"})
             db.update_task(auto_task, status="error")
             with patch.object(service, "_schedule_task", side_effect=lambda task, work: scheduled.append((task, work))):
+                assert service.enqueue_upload(normal, account_id=2) == auto_uid
+            assert db.get_upload(auto_uid)["task_auto"] == 1, "requeueing from the clip page lost the original auto flag"
+            db.update_task(auto_task, status="error")
+            with patch.object(service, "_schedule_task", side_effect=lambda task, work: scheduled.append((task, work))):
                 service.retry_upload(auto_uid)
             with patch.object(service, "_cookie_for", return_value="offline"), patch.object(app.BilibiliUploader, "upload", return_value="BV-automatic") as uploader, patch.object(app.BilibiliUploader, "find_receipt", return_value={"bvid": "BV-automatic", "state": -50}):
                 scheduled[-1][1]()

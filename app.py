@@ -2630,13 +2630,20 @@ class Database:
                 record = conn.execute("SELECT deleted FROM recordings WHERE id=?", (int(payload["recording_id"]),)).fetchone()
                 if record and record["deleted"]:
                     raise ValueError("录播已删除，请重新下载或导入后再处理。")
-            row = conn.execute("SELECT * FROM tasks WHERE kind=? AND unique_key=?", (clean_kind, clean_key)).fetchone()
+            row = conn.execute(
+                """SELECT id, status, CASE WHEN kind='upload' AND json_valid(payload_json)
+                          THEN json_extract(payload_json, '$.auto') END AS previous_auto
+                   FROM tasks WHERE kind=? AND unique_key=?""", (clean_kind, clean_key),
+            ).fetchone()
             if row:
                 task_id = int(row["id"])
                 status = str(row["status"] or "")
                 if status in {"running", "queued", "retry"}:
                     return task_id, False
                 if force or status in {"error", "cancelled"}:
+                    # Older automatic posts may carry their origin only in this task payload.
+                    if row["previous_auto"]:
+                        encoded = json.dumps({**(payload or {}), "auto": True}, ensure_ascii=False)
                     conn.execute(
                         """UPDATE tasks SET status='queued',archived=0,progress=0,message='',payload_json=?,result_json='{}',error='',cancel_requested=0,updated_at=?,started_at='',finished_at='' WHERE id=?""",
                         (encoded, timestamp, task_id),
@@ -10636,7 +10643,7 @@ class RecorderService:
         upload = self.db.get_upload(upload_id)
         if not upload:
             return
-        task_id, _ = self.db.create_task("upload", f"upload:{upload_id}", {"upload_id": int(upload_id), "auto": bool(upload.get("task_auto"))}, force=True)
+        task_id, _ = self.db.create_task("upload", f"upload:{upload_id}", {"upload_id": int(upload_id)}, force=True)
         self.db.set_upload_task(upload_id, task_id)
         self._schedule_task(task_id, lambda: self._upload_worker(upload_id, task_id))
 
