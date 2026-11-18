@@ -2800,26 +2800,49 @@ class _QrLoginNoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-class BilibiliClient:
-    def __init__(self, cookie_getter: Callable[[], str]):
-        self.cookie_getter = cookie_getter
-        self._risk_lock = threading.Lock()
-        self._cooldown_until = 0.0
+class BilibiliBackoff:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._deadlines: dict[str, float] = {}
 
-    def _set_cooldown(self, seconds: float) -> None:
-        with self._risk_lock:
-            self._cooldown_until = max(self._cooldown_until, time.monotonic() + max(1.0, seconds))
+    def defer(self, account: str, seconds: float) -> None:
+        with self._lock:
+            self._deadlines[account] = max(self._deadlines.get(account, 0.0), time.monotonic() + max(1.0, seconds))
+
+    def remaining(self, account: str) -> int:
+        with self._lock:
+            remaining = max(0, math.ceil(self._deadlines.get(account, 0.0) - time.monotonic()))
+            if not remaining:
+                self._deadlines.pop(account, None)
+            return remaining
+
+
+class BilibiliClient:
+    def __init__(self, cookie_getter: Callable[[], str | tuple[int, str]], backoff: BilibiliBackoff | None = None):
+        self.cookie_getter = cookie_getter
+        self._backoff = backoff or BilibiliBackoff()
+        self._last_account = ""
+
+    def _credentials(self) -> tuple[int, str]:
+        value = self.cookie_getter()
+        return value if isinstance(value, tuple) else (0, value)
 
     def _cooldown_remaining(self) -> int:
-        with self._risk_lock:
-            return max(0, int(math.ceil(self._cooldown_until - time.monotonic())))
+        return self._backoff.remaining(self._last_account)
 
-    def _request(self, url: str, method: str = "GET", payload: bytes | None = None, headers: dict[str, str] | None = None, timeout: int = 25) -> bytes:
-        remaining = self._cooldown_remaining()
+    def json_request(self, url: str, method: str = "GET", payload: bytes | None = None, headers: dict[str, str] | None = None,
+                     timeout: int = 25, *, credentials: tuple[int, str] | None = None) -> dict[str, Any]:
+        account_id, cookie = credentials if credentials is not None else self._credentials()
+        cookie = (headers or {}).get("Cookie", cookie).strip()
+        values = parse_cookie(cookie)
+        uid = values.get("DedeUserID", "") if values.get("SESSDATA") else ""
+        # Legacy logins can lack a UID. Keep their backoff on the configured account across credential refreshes.
+        account = "uid:" + uid if uid.isdecimal() else f"account:{account_id}"
+        self._last_account = account
+        remaining = self._backoff.remaining(account)
         if remaining:
             raise RuntimeError(f"Bilibili 风控冷却中，约 {remaining} 秒后重试")
         request_headers = {"User-Agent": USER_AGENT, "Accept": "application/json, text/plain, */*", "Referer": "https://live.bilibili.com/"}
-        cookie = self.cookie_getter().strip()
         if cookie:
             request_headers["Cookie"] = cookie
         if headers:
@@ -2827,7 +2850,7 @@ class BilibiliClient:
         request = urllib.request.Request(url, data=payload, headers=request_headers, method=method)
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
-                return response.read()
+                raw = response.read()
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")[:500]
             if exc.code in (403, 412, 429):
@@ -2836,20 +2859,19 @@ class BilibiliClient:
                     delay = min(300, max(30, int(retry_after)))
                 except ValueError:
                     delay = 60 if exc.code in (412, 429) else 30
-                self._set_cooldown(delay)
+                self._backoff.defer(account, delay)
             raise RuntimeError(f"Bilibili HTTP {exc.code}: {body}") from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"网络请求失败: {exc.reason}") from exc
 
-    def json_request(self, url: str, method: str = "GET", payload: bytes | None = None, headers: dict[str, str] | None = None, timeout: int = 25) -> dict[str, Any]:
         try:
-            data = json.loads(self._request(url, method, payload, headers, timeout).decode("utf-8"))
+            data = json.loads(raw.decode("utf-8"))
         except json.JSONDecodeError as exc:
             raise RuntimeError("Bilibili 返回了非 JSON 数据") from exc
         if not isinstance(data, dict):
             raise RuntimeError("Bilibili 返回格式异常")
         if int(data.get("code", 0) or 0) == -352:
-            self._set_cooldown(60)
+            self._backoff.defer(account, 60)
             raise RuntimeError("Bilibili 风控 -352，已进入 60 秒冷却")
         return data
 
@@ -3104,7 +3126,8 @@ class BilibiliClient:
         """Return the token and candidate WebSocket hosts for a live room."""
         # Bind the token and auth UID to one Cookie snapshot, even if the
         # selected account changes while the HTTP request is in flight.
-        cookie = self.cookie_getter().strip()
+        credentials = self._credentials()
+        cookie = credentials[1].strip()
         values = parse_cookie(cookie)
         uid = 0
         if values.get("SESSDATA"):
@@ -3114,7 +3137,7 @@ class BilibiliClient:
         # The older config endpoint remains public and avoids the -352 risk
         # check now applied to getDanmuInfo for unsigned browser requests.
         query = urllib.parse.urlencode({"room_id": room_id, "platform": "pc", "player": "web"})
-        response = self.json_request(f"https://api.live.bilibili.com/room/v1/Danmu/getConf?{query}", headers={"Cookie": cookie})
+        response = self.json_request(f"https://api.live.bilibili.com/room/v1/Danmu/getConf?{query}", credentials=credentials)
         if int(response.get("code", -1)) != 0:
             raise RuntimeError(str(response.get("message") or f"弹幕接口错误 {response.get('code')}"))
         data = response.get("data") or {}
@@ -8632,7 +8655,7 @@ class RecorderService:
         self.settings = settings
         self.db = db
         self.events = events
-        self.client = BilibiliClient(lambda: self._cookie_for("download"))
+        self._bili_backoff = BilibiliBackoff()
         self.uploader = BilibiliUploader(lambda: self._cookie_for("publish"))
         self._fast_stop = threading.Event()
         self.ffmpeg = FFmpeg(settings, self._fast_stop)
@@ -8652,15 +8675,21 @@ class RecorderService:
         self._last_receipt_poll = 0.0
         self._update_pending = False
 
+    def _download_client(self, account_id: int = 0) -> BilibiliClient:
+        return BilibiliClient(lambda: self._credentials_for("download", account_id), self._bili_backoff)
+
     def _cookie_for(self, role: str, account_id: int = 0) -> str:
+        return self._credentials_for(role, account_id)[1]
+
+    def _credentials_for(self, role: str, account_id: int = 0) -> tuple[int, str]:
         account_id = int(account_id or getattr(self.settings, "download_account_id" if role == "download" else "publish_account_id", 0) or 0)
         if account_id:
             cookie = self.db.cookie_for_account(account_id, role)
             if not cookie:
                 label = "下载" if role == "download" else "投稿"
                 raise RuntimeError(f"{label}账号不可用，请在「账号」页重新登录或选择账号。")
-            return cookie
-        return str(self.settings.bili_cookie or "")
+            return account_id, cookie
+        return 0, str(self.settings.bili_cookie or "")
 
     def _task_cancelled(self, task_id: int | None) -> bool:
         return bool(task_id and self.db.task_cancel_requested(int(task_id)))
@@ -8817,7 +8846,7 @@ class RecorderService:
             room_id = str(room["room_id"])
             try:
                 account_id = int(room.get("account_id") or 0)
-                room_client = BilibiliClient(lambda aid=account_id: self._cookie_for("download", aid))
+                room_client = self._download_client(account_id)
                 info = room_client.room_info(room_id)
                 self.db.update_room_status(room_id, bool(info["live_status"]), info["title"])
                 self.emit("room", f"房间 {room_id}：{'直播中' if info['live_status'] else '未开播'}", room_id=room_id)
@@ -9017,7 +9046,8 @@ class RecorderService:
                 if selected_id and not account:
                     self.emit("warning", "账号已移除，请在「账号」页重新选择。")
                     return
-                client = BilibiliClient(lambda: str(account["cookie"])) if account else BilibiliClient(lambda: self._cookie_for("publish"))
+                client = BilibiliClient(lambda: (int(selected_id), str(account["cookie"])) if account
+                                       else self._credentials_for("publish"), self._bili_backoff)
                 result = client.check_login()
                 if account:
                     self.db.set_cookie_account_status(selected_id, bool(account["enabled"]), "登录有效" if result.get("ok") else "登录已失效，请重新扫码")
@@ -9056,7 +9086,7 @@ class RecorderService:
                     return
                 post("confirming", "登录已确认，正在读取账号信息…")
                 try:
-                    result = BilibiliClient(lambda: cookie).check_login()
+                    result = BilibiliClient(lambda: cookie, self._bili_backoff).check_login()
                 except Exception as exc:
                     raise RuntimeError("读取账号信息失败，请检查网络后重新扫码。") from exc
                 profile = result.get("data") or {}
@@ -9096,8 +9126,11 @@ class RecorderService:
             try:
                 room = self.db.get_room(room_id) or {}
                 replay_source = str(room.get("replay_source") or "").strip()
-                cookie = self._cookie_for("download", int(room.get("account_id") or 0))
-                items = self.replay_downloader.discover(replay_source, 30, cookie) if replay_source else self.client.discover_replays_by_room(room_id)
+                account_id = int(room.get("account_id") or 0)
+                if replay_source:
+                    items = self.replay_downloader.discover(replay_source, 30, self._cookie_for("download", account_id))
+                else:
+                    items = self._download_client(account_id).discover_replays_by_room(room_id)
                 for item in items:
                     if isinstance(item, dict):
                         item.setdefault("source_liver_uid", str(room.get("uid") or ""))
@@ -9386,7 +9419,7 @@ class RecorderService:
         try:
             room = self.db.get_room(room_id) or {}
             account_id = int(room.get("account_id") or 0)
-            recovery_client = BilibiliClient(lambda: self._cookie_for("download", account_id))
+            recovery_client = self._download_client(account_id)
             live = bool(recovery_client.room_info(room_id).get("live_status"))
         except Exception:
             live = True
@@ -9416,7 +9449,7 @@ class RecorderService:
             self.ffmpeg.ensure_tools()
             room_config = self.db.get_room(room_id) or {}
             room_account_id = int(room_config.get("account_id") or 0)
-            room_client = BilibiliClient(lambda: self._cookie_for("download", room_account_id))
+            room_client = self._download_client(room_account_id)
             info = room_client.room_info(room_id)
             if not info["live_status"] or state["stop"].is_set() or self.stop_event.is_set():
                 return

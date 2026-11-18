@@ -2360,6 +2360,53 @@ def assert_batch_cleanup() -> None:
     print("Batch cleanup checks passed: partial failures, validation, active guards, migration, deduplication and history retention")
 
 
+def assert_room_account_backoff() -> None:
+    with tempfile.TemporaryDirectory(prefix="liveclip-room-backoff-") as folder:
+        settings = app.Settings(base_dir=folder, download_account_id=7)
+        db = app.Database(Path(folder) / "app.db")
+        for room, account in (("101", 0), ("102", 7), ("103", 8)):
+            db.add_room(room, room)
+            db.update_room_config(room, account_id=account)
+        service = app.RecorderService(settings, db, app.queue.Queue())
+        credentials = {7: "offline-a", 8: "offline-b"}
+        calls = []
+
+        def request(req, timeout):
+            cookie = req.get_header("Cookie")
+            calls.append(cookie)
+            if len(calls) == 1:
+                raise urllib.error.HTTPError(req.full_url, 412, "blocked", {"Retry-After": "80"}, io.BytesIO())
+            return io.BytesIO(b'{"code": 0, "data": {"live_status": 0}}')
+
+        try:
+            with patch.object(db, "cookie_for_account", side_effect=lambda aid, role: credentials[aid]), \
+                    patch.object(app.urllib.request, "urlopen", side_effect=request), \
+                    patch.object(app.time, "monotonic", return_value=100) as clock:
+                service.check_now()
+                assert calls == ["offline-a", "offline-b"], calls
+                service._schedule_recording_recovery("102", {})
+                with patch.object(service.ffmpeg, "ensure_tools"):
+                    service._record_worker("102", {"stop": threading.Event()})
+                service.check_now()
+                assert calls == ["offline-a", "offline-b", "offline-b"], calls
+                settings.download_account_id = 8
+                credentials[8] = "offline-b-renewed"
+                clock.return_value = 179
+                service.check_now()
+                assert calls[3:] == ["offline-b-renewed", "offline-b-renewed"], calls
+                credentials[7] = "offline-a-renewed"
+                clock.return_value = 181
+                service.check_now()
+                assert calls[5:] == ["offline-b-renewed", "offline-a-renewed", "offline-b-renewed"], calls
+                credentials.update({7: "SESSDATA=old; DedeUserID=44", 8: "SESSDATA=new; DedeUserID=44"})
+                with patch.object(app.urllib.request, "urlopen", return_value=io.BytesIO(b'{"code": -352}')) as blocked:
+                    service.check_now()
+                    service.check_now()
+                    blocked.assert_called_once()
+        finally:
+            service.executor.shutdown(wait=True)
+
+
 def assert_replay_discovery() -> None:
     client = app.BilibiliClient(lambda: "")
     calls = []
@@ -4759,6 +4806,7 @@ if __name__ == "__main__":
     assert_recording_deletion()
     assert_clip_deletion()
     assert_batch_cleanup()
+    assert_room_account_backoff()
     assert_replay_discovery()
     assert_replay_import_workflow()
     app.run_self_test()
